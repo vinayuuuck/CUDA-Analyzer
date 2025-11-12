@@ -28,31 +28,76 @@ class CodeInstrumenter:
 
     def insert_optimization_calls(self, kernel_info: List[Dict]) -> str:
         """
-        Insert printf statements before kernel launches
-        This demonstrates the instrumentation concept
+        Insert runtime parameter selection calls before kernel launches
+        Similar to KLARAPTOR's LLVM Pass instrumentation
         """
         code = self.source_code
 
-        # Find kernel launch patterns: kernelName<<<grid, block>>>
-        # We'll insert a printf before each one
+        # Add include for the driver header at the top of the file
+        if '#include "klaraptor_driver.h"' not in code:
+            # Find the last #include or add after the first few lines
+            include_pattern = r"(#include\s+[<\"][^>\"]+[>\"])"
+            matches = list(re.finditer(include_pattern, code))
+            if matches:
+                last_include = matches[-1]
+                insertion_point = last_include.end()
+                code = (
+                    code[:insertion_point]
+                    + '\n#include "klaraptor_driver.h"'
+                    + code[insertion_point:]
+                )
+            else:
+                # Add at the beginning if no includes found
+                code = '#include "klaraptor_driver.h"\n' + code
 
+        # Track which kernels we've already instrumented to avoid duplicates
+        seen_kernels = set()
+
+        # Find kernel launch patterns: kernelName<<<grid, block>>>
+        # Replace with dynamic parameter selection
         for kernel in kernel_info:
             kernel_name = kernel["name"]
 
-            # Pattern to find kernel launches
-            # Matches: kernelName<<<...>>>(...);
-            pattern = rf"({kernel_name}\s*<<<[^>]+>>>)"
+            # Skip if we've already instrumented this kernel
+            if kernel_name in seen_kernels:
+                continue
+            seen_kernels.add(kernel_name)
 
-            # Replacement: insert printf before the launch
-            replacement = (
-                f"// INSTRUMENTATION: Optimizing {kernel_name}\n"
-                f'    printf("ORC: Optimizing kernel {kernel_name} (dim=%dD, compute=%.2f)\\n", '
-                f'{kernel["thread_usage"]["dimensionality"]}, '
-                f'{kernel["metrics"]["compute_intensity"]:.2f}f);\n'
-                f"    \\1"
-            )
+            # Extract kernel characteristics for the driver
+            characteristics = {
+                "dimensionality": kernel["thread_usage"]["dimensionality"],
+                "compute_intensity": kernel["metrics"]["compute_intensity"],
+                "shared_memory": kernel["memory_access"]["shared_memory"],
+                "global_reads": kernel["memory_access"]["global_reads"],
+                "global_writes": kernel["memory_access"]["global_writes"],
+            }
 
-            code = re.sub(pattern, replacement, code)
+            # Pattern to match: kernelName<<<grid, block>>>
+            # Capture the original grid and block expressions
+            pattern = rf"{re.escape(kernel_name)}\s*<<<\s*([^,]+)\s*,\s*([^>]+)\s*>>>"
+
+            def replace_launch(match):
+                original_grid = match.group(1).strip()
+                original_block = match.group(2).strip()
+
+                # Generate the instrumentation code
+                instrumentation = f"""// KLARAPTOR instrumentation for {kernel_name}
+    dim3 klaraptor_grid_{kernel_name}, klaraptor_block_{kernel_name};
+    selectOptimalParams(
+        "{kernel_name}",
+        {original_grid}, {original_block},  // original parameters
+        &klaraptor_grid_{kernel_name}, &klaraptor_block_{kernel_name},  // output parameters
+        {characteristics['dimensionality']},
+        {characteristics['compute_intensity']:.2f},
+        {int(characteristics['shared_memory'])},
+        {characteristics['global_reads']},
+        {characteristics['global_writes']}
+    );
+    {kernel_name}<<<klaraptor_grid_{kernel_name}, klaraptor_block_{kernel_name}>>>"""
+
+                return instrumentation
+
+            code = re.sub(pattern, replace_launch, code)
 
         self.instrumented_code = code
         return code
@@ -66,9 +111,23 @@ class CodeInstrumenter:
     def compile_code(self, source_file: str, output_binary: str) -> bool:
         """Compile the instrumented code"""
 
+        # Get the directory containing the driver library
+        driver_dir = Path(__file__).parent
+        driver_lib = driver_dir / "klaraptor_driver.cu"
+
         # Try nvcc first (if CUDA is available), then fall back to clang/gcc
         compilers = [
-            (["nvcc", "-o", output_binary, source_file], "NVCC"),
+            (
+                [
+                    "nvcc",
+                    "-o",
+                    output_binary,
+                    source_file,
+                    str(driver_lib),
+                    f"-I{driver_dir}",
+                ],
+                "NVCC",
+            ),
             (
                 [
                     "clang++",
@@ -106,6 +165,7 @@ class CodeInstrumenter:
         ]
 
         for cmd, compiler_name in compilers:
+            print("try to compile with:", compiler_name)
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
 
@@ -147,11 +207,6 @@ class OrcMain:
                 return False
 
             print(f"✓ Found {len(self.kernel_info)} kernel(s)")
-
-            # Save analysis
-            analysis_file = self.output_dir / "analysis.json"
-            self.analyzer.generate_report(str(analysis_file))
-
             return True
 
         except Exception as e:
@@ -258,7 +313,7 @@ def main():
         sys.exit(1)
 
     cuda_file = sys.argv[1]
-    output_dir = sys.argv[2] if len(sys.argv) > 2 else "output"
+    output_dir = sys.argv[2] if len(sys.argv) > 2 else "./"
 
     if not os.path.exists(cuda_file):
         print(f"Error: '{cuda_file}' not found")
