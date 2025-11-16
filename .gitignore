@@ -217,3 +217,10 @@ __marimo__/
 
 # MacOS Junk
 .DS_Store
+
+# Pickle stuff
+*.pkl
+
+# Analyzer output
+*_instrumented.cu
+*_instrumented

@@ -49,8 +49,7 @@ class CUDAKernelAnalyzer:
         tu = self.index.parse(
             self.cuda_file,
             args=args,
-            options=clang.cindex.TranslationUnit.PARSE_SKIP_FUNCTION_BODIES
-            | clang.cindex.TranslationUnit.PARSE_INCOMPLETE,
+            options=clang.cindex.TranslationUnit.PARSE_INCOMPLETE,
         )
 
         if not tu:
@@ -76,6 +75,23 @@ class CUDAKernelAnalyzer:
             "array_accesses": [],
         }
 
+        # Get source text for simpler pattern matching
+        import re
+        tokens = list(cursor.get_tokens())
+        source_text = " ".join([t.spelling for t in tokens])
+        
+        # Count array writes: pattern like "array[index] ="
+        write_pattern = r'\w+\s*\[\s*[^\]]+\s*\]\s*='
+        writes = re.findall(write_pattern, source_text)
+        memory_info["global_writes"] = len(writes)
+        
+        # Count all array accesses
+        array_pattern = r'\w+\s*\[\s*[^\]]+\s*\]'
+        all_accesses = re.findall(array_pattern, source_text)
+        
+        # Reads = total accesses - writes
+        memory_info["global_reads"] = max(len(all_accesses) - len(writes), 0)
+
         def visit_node(node):
             # Check for shared memory declarations
             if node.kind == CursorKind.VAR_DECL:
@@ -85,24 +101,8 @@ class CUDAKernelAnalyzer:
                     memory_info["shared_memory"] = True
                     memory_info["shared_arrays"].append(node.spelling)
 
-            # Check for array subscript operations (memory accesses)
+            # Collect detailed array access info
             if node.kind == CursorKind.ARRAY_SUBSCRIPT_EXPR:
-                parent = node.semantic_parent
-                # Try to determine if it's a read or write
-                if parent and parent.kind == CursorKind.BINARY_OPERATOR:
-                    tokens = list(parent.get_tokens())
-                    if any(t.spelling == "=" for t in tokens):
-                        # Check if array is on left side (write) or right side (read)
-                        lhs = list(parent.get_children())[0]
-                        if node.location.offset <= lhs.extent.end.offset:
-                            memory_info["global_writes"] += 1
-                        else:
-                            memory_info["global_reads"] += 1
-                    else:
-                        memory_info["global_reads"] += 1
-                else:
-                    memory_info["global_reads"] += 1
-
                 memory_info["array_accesses"].append(
                     {
                         "line": node.location.line,
@@ -135,34 +135,21 @@ class CUDAKernelAnalyzer:
             "dimensionality": 1,
         }
 
-        def visit_node(node):
-            if node.kind == CursorKind.MEMBER_REF_EXPR:
-                tokens = list(node.get_tokens())
-                token_str = "".join([t.spelling for t in tokens])
-
-                if "threadIdx.x" in token_str:
-                    thread_info["uses_threadIdx_x"] = True
-                elif "threadIdx.y" in token_str:
-                    thread_info["uses_threadIdx_y"] = True
-                elif "threadIdx.z" in token_str:
-                    thread_info["uses_threadIdx_z"] = True
-                elif "blockIdx.x" in token_str:
-                    thread_info["uses_blockIdx_x"] = True
-                elif "blockIdx.y" in token_str:
-                    thread_info["uses_blockIdx_y"] = True
-                elif "blockIdx.z" in token_str:
-                    thread_info["uses_blockIdx_z"] = True
-                elif "blockDim.x" in token_str:
-                    thread_info["uses_blockDim_x"] = True
-                elif "blockDim.y" in token_str:
-                    thread_info["uses_blockDim_y"] = True
-                elif "blockDim.z" in token_str:
-                    thread_info["uses_blockDim_z"] = True
-
-            for child in node.get_children():
-                visit_node(child)
-
-        visit_node(cursor)
+        # Also get all tokens from the function to catch cases where
+        # clang doesn't parse threadIdx/blockIdx as expected
+        all_tokens = list(cursor.get_tokens())
+        source_text = " ".join([t.spelling for t in all_tokens])
+        
+        # Direct text search as backup
+        thread_info["uses_threadIdx_x"] = "threadIdx.x" in source_text or "threadIdx . x" in source_text
+        thread_info["uses_threadIdx_y"] = "threadIdx.y" in source_text or "threadIdx . y" in source_text
+        thread_info["uses_threadIdx_z"] = "threadIdx.z" in source_text or "threadIdx . z" in source_text
+        thread_info["uses_blockIdx_x"] = "blockIdx.x" in source_text or "blockIdx . x" in source_text
+        thread_info["uses_blockIdx_y"] = "blockIdx.y" in source_text or "blockIdx . y" in source_text
+        thread_info["uses_blockIdx_z"] = "blockIdx.z" in source_text or "blockIdx . z" in source_text
+        thread_info["uses_blockDim_x"] = "blockDim.x" in source_text or "blockDim . x" in source_text
+        thread_info["uses_blockDim_y"] = "blockDim.y" in source_text or "blockDim . y" in source_text
+        thread_info["uses_blockDim_z"] = "blockDim.z" in source_text or "blockDim . z" in source_text
 
         # Determine dimensionality
         if thread_info["uses_threadIdx_z"] or thread_info["uses_blockIdx_z"]:
@@ -279,12 +266,42 @@ class CUDAKernelAnalyzer:
         with open(self.cuda_file, "r") as f:
             content = f.read()
 
-        # Find __global__ functions
-        pattern = r"__global__\s+\w+\s+(\w+)\s*\([^)]*\)"
-        matches = re.finditer(pattern, content)
+        # Find __global__ functions with their bodies
+        # Match: __global__ void kernelName(...) { ... }
+        pattern = r"__global__\s+\w+\s+(\w+)\s*\([^)]*\)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\}"
+        matches = re.finditer(pattern, content, re.DOTALL)
 
         for match in matches:
             kernel_name = match.group(1)
+            kernel_body = match.group(2) if len(match.groups()) > 1 else match.group(0)
+            
+            # Analyze this specific kernel's body
+            uses_threadIdx_x = "threadIdx.x" in kernel_body
+            uses_threadIdx_y = "threadIdx.y" in kernel_body
+            uses_threadIdx_z = "threadIdx.z" in kernel_body
+            uses_blockIdx_x = "blockIdx.x" in kernel_body
+            uses_blockIdx_y = "blockIdx.y" in kernel_body
+            uses_blockIdx_z = "blockIdx.z" in kernel_body
+            
+            # Determine dimensionality from this kernel only
+            if uses_threadIdx_z or uses_blockIdx_z:
+                dimensionality = 3
+            elif uses_threadIdx_y or uses_blockIdx_y:
+                dimensionality = 2
+            else:
+                dimensionality = 1
+            
+            # Count operations in this kernel body
+            array_accesses = kernel_body.count("[")
+            arithmetic_ops = kernel_body.count("+") + kernel_body.count("-") + kernel_body.count("*") + kernel_body.count("/")
+            
+            # Estimate reads vs writes (assignments with = typically mean writes)
+            # Count array accesses on left side of = as writes
+            write_count = len(re.findall(r'\w+\[[^\]]+\]\s*=', kernel_body))
+            read_count = max(array_accesses - write_count, 1)
+            
+            has_shared = "__shared__" in kernel_body
+            
             # Create minimal kernel info
             kernel_info = {
                 "name": kernel_name,
@@ -294,43 +311,39 @@ class CUDAKernelAnalyzer:
                 },
                 "parameters": [],
                 "thread_usage": {
-                    "uses_threadIdx_x": "threadIdx.x" in content,
-                    "uses_threadIdx_y": "threadIdx.y" in content,
-                    "uses_threadIdx_z": "threadIdx.z" in content,
-                    "dimensionality": self._guess_dimensionality(content, kernel_name),
+                    "uses_threadIdx_x": uses_threadIdx_x,
+                    "uses_threadIdx_y": uses_threadIdx_y,
+                    "uses_threadIdx_z": uses_threadIdx_z,
+                    "uses_blockIdx_x": uses_blockIdx_x,
+                    "uses_blockIdx_y": uses_blockIdx_y,
+                    "uses_blockIdx_z": uses_blockIdx_z,
+                    "dimensionality": dimensionality,
                 },
                 "memory_access": {
-                    "global_reads": content.count("[")
-                    // len(self.kernels + [1]),  # rough estimate
-                    "global_writes": 1,
-                    "shared_memory": "__shared__" in content,
+                    "global_reads": read_count,
+                    "global_writes": max(write_count, 1),
+                    "shared_memory": has_shared,
                     "shared_arrays": [],
                 },
                 "operations": {
-                    "arithmetic": content.count("+") + content.count("*"),
-                    "memory": content.count("["),
-                    "control_flow": content.count("if"),
-                    "loops": content.count("for"),
-                },
-                "metrics": {
-                    "compute_intensity": 1.0,
-                    "has_shared_memory": "__shared__" in content,
-                    "dimensionality": self._guess_dimensionality(content, kernel_name),
+                    "arithmetic": arithmetic_ops,
+                    "memory": array_accesses,
+                    "control_flow": kernel_body.count("if"),
+                    "loops": kernel_body.count("for") + kernel_body.count("while"),
                 },
             }
+            
+            # Calculate compute intensity
+            total_memory_ops = read_count + max(write_count, 1)
+            kernel_info["metrics"] = {
+                "compute_intensity": arithmetic_ops / total_memory_ops if total_memory_ops > 0 else 1.0,
+                "has_shared_memory": has_shared,
+                "dimensionality": dimensionality,
+            }
+            
             self.kernels.append(kernel_info)
 
         return self.kernels
-
-    def _guess_dimensionality(self, content: str, kernel_name: str) -> int:
-        """Guess kernel dimensionality from thread index usage"""
-        # Find the kernel body roughly
-        if "threadIdx.z" in content or "blockIdx.z" in content:
-            return 3
-        elif "threadIdx.y" in content or "blockIdx.y" in content:
-            return 2
-        else:
-            return 1
 
     def generate_report(self, output_file: Optional[str] = None):
         """Generate a detailed analysis report"""
