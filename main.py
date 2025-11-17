@@ -1,337 +1,419 @@
+#!/usr/bin/env python3
+"""
+CUDA Kernel Launch Configuration Optimizer
+Suggests optimal grid/block configurations using multiple ML approaches
+"""
 import sys
 import os
-import subprocess
-import re
 from pathlib import Path
-from typing import Dict, List
-
-try:
-    from cuda_anal import CUDAKernelAnalyzer
-except ImportError:
-    print("Error: cuda_anal.py not found")
-    sys.exit(1)
+import pickle
+import numpy as np
+import torch
+from cuda_anal import CUDAKernelAnalyzer
 
 
-class CodeInstrumenter:
-    """Instruments CUDA source code by inserting optimization calls"""
+class MultiModelSuggester:
+    """
+    Suggests optimal launch configs using 3 approaches:
+    1. Random Forest (baseline)
+    2. Ensemble DNNs (best accuracy)
+    3. Fine-tuned LLM (if available)
+    """
+    
+    def __init__(self):
+        self.models_loaded = {
+            'random_forest': False,
+            'ensemble': False,
+            'llm': False
+        }
+        
+        # Try to load Random Forest
+        try:
+            self._load_random_forest()
+        except Exception as e:
+            print(f"⚠ Random Forest not available: {e}")
+        
+        # Try to load Ensemble DNNs
+        try:
+            self._load_ensemble()
+        except Exception as e:
+            print(f"⚠ Ensemble DNNs not available: {e}")
+        
+        # Try to load LLM
+        try:
+            self._load_llm()
+        except Exception as e:
+            print(f"⚠ LLM not available: {e}")
+        
+        if not any(self.models_loaded.values()):
+            raise RuntimeError("No models available! Train at least one model first.")
+    
+    def _load_random_forest(self):
+        """Load Random Forest model"""
+        model_path = "grid_block_model.pkl"
+        features_path = "feature_names.pkl"
+        
+        if not os.path.exists(model_path):
+            return
+        
+        with open(model_path, "rb") as f:
+            model_data = pickle.load(f)
+            if isinstance(model_data, dict):
+                self.rf_model = model_data["model"]
+                self.rf_log_transform = model_data.get("log_transform", False)
+            else:
+                self.rf_model = model_data
+                self.rf_log_transform = False
+        
+        with open(features_path, "rb") as f:
+            self.rf_feature_names = pickle.load(f)
+        
+        self.models_loaded['random_forest'] = True
+        print("✓ Random Forest loaded")
+    
+    def _load_ensemble(self):
+        """Load Ensemble DNN models"""
+        from ensemble_exec_time_predictor import EnsemblePredictor
+        
+        models_dir = "ensemble_models"
+        if not os.path.exists(models_dir):
+            return
+        
+        # Check if at least one model exists
+        has_models = any((Path(models_dir) / model).exists() 
+                        for model in ['fast', 'medium', 'slow'])
+        if not has_models:
+            return
+        
+        self.ensemble = EnsemblePredictor(models_dir)
+        self.models_loaded['ensemble'] = True
+        print("✓ Ensemble DNNs loaded")
+    
+    def _load_llm(self):
+        """Load fine-tuned LLM"""
+        import re
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        
+        llm_dir = "cuda_block_predictor_llm"
+        if not os.path.exists(llm_dir):
+            return
+        
+        self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_dir)
+        self.llm_model = AutoModelForCausalLM.from_pretrained(
+            llm_dir,
+            device_map="auto" if torch.cuda.is_available() else None
+        )
+        self.llm_model.eval()
+        
+        self.models_loaded['llm'] = True
+        print("✓ LLM loaded")
+    
+    def _predict_random_forest(self, kernel_info, N, candidates):
+        """Predict using Random Forest"""
+        predictions = []
+        
+        for bx, by, bz in candidates:
+            total_threads = bx * by * bz
+            
+            features = np.array([[
+                N, bx, by, bz, total_threads,
+                kernel_info['dimensionality'],
+                kernel_info['compute_intensity'],
+                kernel_info['has_shared_memory'],
+                kernel_info['global_reads'],
+                kernel_info['global_writes'],
+                kernel_info['arithmetic_ops'],
+                kernel_info['memory_ops'],
+            ]])
+            
+            pred_log_time = self.rf_model.predict(features)[0]
+            pred_time = np.expm1(pred_log_time) if self.rf_log_transform else pred_log_time
+            
+            predictions.append({
+                'block_x': bx,
+                'block_y': by,
+                'block_z': bz,
+                'predicted_time': pred_time
+            })
+        
+        return sorted(predictions, key=lambda x: x['predicted_time'])
+    
+    def _predict_ensemble(self, kernel_info, N, candidates):
+        """Predict using Ensemble DNNs"""
+        # Add N to kernel_info
+        kernel_info_with_n = kernel_info.copy()
+        kernel_info_with_n['N'] = N
+        
+        # Get predictions for all candidates
+        _, _, _, all_preds = self.ensemble.predict_optimal_config(
+            kernel_info_with_n, 
+            candidate_configs=[(bx, by) for bx, by, _ in candidates]
+        )
+        
+        return all_preds
+    
+    def _predict_llm(self, kernel_info, N, candidates):
+        """Predict using fine-tuned LLM"""
+        import re
+        
+        predictions = []
+        
+        for bx, by, bz in candidates:
+            total_threads = bx * by
+            
+            prompt = f"""### Kernel: {kernel_info['kernel_name']}
+N: {N}
+dimensionality: {kernel_info['dimensionality']}D
+compute_intensity: {kernel_info['compute_intensity']:.2f}
+has_shared_memory: {kernel_info['has_shared_memory']}
+global_reads: {kernel_info['global_reads']}
+global_writes: {kernel_info['global_writes']}
+arithmetic_ops: {kernel_info['arithmetic_ops']}
+memory_ops: {kernel_info['memory_ops']}
+Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
 
-    def __init__(self, cuda_file: str):
-        self.cuda_file = cuda_file
-        self.source_code = ""
-        self.instrumented_code = ""
-
-    def read_source(self) -> str:
-        """Read the original source code"""
-        with open(self.cuda_file, "r") as f:
-            self.source_code = f.read()
-        return self.source_code
-
-    def insert_optimization_calls(self, kernel_info: List[Dict]) -> str:
-        """
-        Insert runtime parameter selection calls before kernel launches
-        Similar to KLARAPTOR's LLVM Pass instrumentation
-        """
-        code = self.source_code
-
-        # Add include for the driver header at the top of the file
-        if '#include "klaraptor_driver.h"' not in code:
-            # Find the last #include or add after the first few lines
-            include_pattern = r"(#include\s+[<\"][^>\"]+[>\"])"
-            matches = list(re.finditer(include_pattern, code))
-            if matches:
-                last_include = matches[-1]
-                insertion_point = last_include.end()
-                code = (
-                    code[:insertion_point]
-                    + '\n#include "klaraptor_driver.h"'
-                    + code[insertion_point:]
+### Predicted Execution Time:
+"""
+            
+            inputs = self.llm_tokenizer(prompt, return_tensors="pt")
+            device = next(self.llm_model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            
+            with torch.no_grad():
+                outputs = self.llm_model.generate(
+                    **inputs,
+                    max_new_tokens=50,
+                    temperature=0.1,
+                    do_sample=True,
+                    pad_token_id=self.llm_tokenizer.eos_token_id
                 )
+            
+            generated_text = self.llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # Extract exec_time
+            match = re.search(r'exec_time:\s*([\d.]+)\s*ms', generated_text)
+            if match:
+                exec_time = float(match.group(1))
             else:
-                # Add at the beginning if no includes found
-                code = '#include "klaraptor_driver.h"\n' + code
-
-        # Track which kernels we've already instrumented to avoid duplicates
-        seen_kernels = set()
-
-        # Find kernel launch patterns: kernelName<<<grid, block>>>
-        # Replace with dynamic parameter selection
-        for kernel in kernel_info:
-            kernel_name = kernel["name"]
-
-            # Skip if we've already instrumented this kernel
-            if kernel_name in seen_kernels:
-                continue
-            seen_kernels.add(kernel_name)
-
-            # Extract kernel characteristics for the driver
-            characteristics = {
-                "dimensionality": kernel["thread_usage"]["dimensionality"],
-                "compute_intensity": kernel["metrics"]["compute_intensity"],
-                "shared_memory": kernel["memory_access"]["shared_memory"],
-                "global_reads": kernel["memory_access"]["global_reads"],
-                "global_writes": kernel["memory_access"]["global_writes"],
+                exec_time = 999.0  # Fallback
+            
+            predictions.append({
+                'block_x': bx,
+                'block_y': by,
+                'block_z': bz,
+                'predicted_time': exec_time / 1000.0  # Convert to seconds
+            })
+        
+        return sorted(predictions, key=lambda x: x['predicted_time'])
+    
+    def suggest(self, cuda_file, N):
+        """
+        Suggest optimal configurations using all available models
+        
+        Args:
+            cuda_file: Path to .cu file
+            N: Problem size
+            
+        Returns:
+            dict with results from all models
+        """
+        print(f"\n{'='*80}")
+        print(f"ANALYZING: {cuda_file}")
+        print(f"Problem size: N={N}")
+        print(f"{'='*80}\n")
+        
+        # Analyze kernel
+        if not os.path.exists(cuda_file):
+            raise FileNotFoundError(f"File not found: {cuda_file}")
+        
+        analyzer = CUDAKernelAnalyzer(cuda_file)
+        kernels = analyzer.analyze()
+        
+        if not kernels:
+            raise ValueError("No CUDA kernels found!")
+        
+        results = []
+        
+        for kernel_data in kernels:
+            kernel_name = kernel_data['name']
+            print(f"\n{'─'*80}")
+            print(f"KERNEL: {kernel_name}")
+            print(f"{'─'*80}")
+            
+            # Extract features
+            metrics = kernel_data['metrics']
+            memory = kernel_data['memory_access']
+            ops = kernel_data['operations']
+            thread_usage = kernel_data['thread_usage']
+            
+            kernel_info = {
+                'kernel_name': kernel_name,
+                'dimensionality': metrics.get('dimensionality', thread_usage.get('dimensionality', 1)),
+                'compute_intensity': metrics.get('compute_intensity', 1.0),
+                'has_shared_memory': int(metrics.get('has_shared_memory', memory.get('shared_memory', False))),
+                'global_reads': memory.get('global_reads', 10),
+                'global_writes': memory.get('global_writes', 5),
+                'arithmetic_ops': ops.get('arithmetic', 100),
+                'memory_ops': ops.get('memory', 15),
+                'control_flow_ops': ops.get('control_flow', 0),
+                'loop_ops': ops.get('loops', 0),
+                'uses_syncthreads': int(metrics.get('uses_syncthreads', False)),
+                'estimated_flops': metrics.get('estimated_flops', 0),
+                'estimated_memory_bytes': metrics.get('estimated_memory_bytes', 0),
+                'uses_threadIdx_x': int(thread_usage.get('uses_threadIdx_x', False)),
+                'uses_threadIdx_y': int(thread_usage.get('uses_threadIdx_y', False)),
+                'uses_threadIdx_z': int(thread_usage.get('uses_threadIdx_z', False)),
+                'uses_blockIdx_x': int(thread_usage.get('uses_blockIdx_x', False)),
+                'uses_blockIdx_y': int(thread_usage.get('uses_blockIdx_y', False)),
+                'uses_blockIdx_z': int(thread_usage.get('uses_blockIdx_z', False)),
+                'uses_blockDim_x': int(thread_usage.get('uses_blockDim_x', False)),
+                'uses_blockDim_y': int(thread_usage.get('uses_blockDim_y', False)),
+                'uses_blockDim_z': int(thread_usage.get('uses_blockDim_z', False)),
             }
-
-            # Pattern to match: kernelName<<<grid, block>>>
-            # Capture the original grid and block expressions
-            pattern = rf"{re.escape(kernel_name)}\s*<<<\s*([^,]+)\s*,\s*([^>]+)\s*>>>"
-
-            def replace_launch(match):
-                original_grid = match.group(1).strip()
-                original_block = match.group(2).strip()
-
-                # Generate the instrumentation code
-                instrumentation = f"""// KLARAPTOR instrumentation for {kernel_name}
-    dim3 klaraptor_grid_{kernel_name}, klaraptor_block_{kernel_name};
-    selectOptimalParams(
-        "{kernel_name}",
-        {original_grid}, {original_block},  // original parameters
-        &klaraptor_grid_{kernel_name}, &klaraptor_block_{kernel_name},  // output parameters
-        {characteristics['dimensionality']},
-        {characteristics['compute_intensity']:.2f},
-        {int(characteristics['shared_memory'])},
-        {characteristics['global_reads']},
-        {characteristics['global_writes']}
-    );
-    {kernel_name}<<<klaraptor_grid_{kernel_name}, klaraptor_block_{kernel_name}>>>"""
-
-                return instrumentation
-
-            code = re.sub(pattern, replace_launch, code)
-
-        self.instrumented_code = code
-        return code
-
-    def save_instrumented_code(self, output_file: str) -> str:
-        """Save the instrumented code to a file"""
-        with open(output_file, "w") as f:
-            f.write(self.instrumented_code)
-        return output_file
-
-    def compile_code(self, source_file: str, output_binary: str) -> bool:
-        """Compile the instrumented code"""
-
-        # Get the directory containing the driver library
-        driver_dir = Path(__file__).parent
-        driver_lib = driver_dir / "klaraptor_driver.cu"
-
-        # Try nvcc first (if CUDA is available), then fall back to clang/gcc
-        compilers = [
-            (
-                [
-                    "nvcc",
-                    "-o",
-                    output_binary,
-                    source_file,
-                    str(driver_lib),
-                    f"-I{driver_dir}",
-                ],
-                "NVCC",
-            ),
-            (
-                [
-                    "clang++",
-                    "-x",
-                    "c++",
-                    "-o",
-                    output_binary,
-                    source_file,
-                    "-Wno-everything",
-                    "-D__CUDACC__",
-                    "-D__global__=",
-                    "-D__device__=",
-                    "-D__host__=",
-                    "-Ddim3=int",
-                ],
-                "Clang++",
-            ),
-            (
-                [
-                    "g++",
-                    "-x",
-                    "c++",
-                    "-o",
-                    output_binary,
-                    source_file,
-                    "-w",
-                    "-D__CUDACC__",
-                    "-D__global__=",
-                    "-D__device__=",
-                    "-D__host__=",
-                    "-Ddim3=int",
-                ],
-                "G++",
-            ),
-        ]
-
-        for cmd, compiler_name in compilers:
-            print("try to compile with:", compiler_name)
-            try:
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
-                if result.returncode == 0:
-                    print(f"✓ Compiled with {compiler_name}: {output_binary}")
-                    return True
-
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                continue
-            except Exception as e:
-                continue
-
-        print(f"✗ Compilation failed with all compilers")
-        return False
-
-
-class OrcMain:
-    """Main orchestrator"""
-
-    def __init__(self, cuda_file: str, output_dir: str = "output"):
-        self.cuda_file = cuda_file
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-
-        self.analyzer = None
-        self.instrumenter = None
-        self.kernel_info = []
-
-    def run_analysis(self) -> bool:
-        """Analyze CUDA kernels"""
-        print("Phase 1: Analyzing kernels...")
-
-        try:
-            self.analyzer = CUDAKernelAnalyzer(self.cuda_file)
-            self.kernel_info = self.analyzer.analyze()
-
-            if not self.kernel_info:
-                print("✗ No kernels found")
-                return False
-
-            print(f"✓ Found {len(self.kernel_info)} kernel(s)")
-            return True
-
-        except Exception as e:
-            print(f"✗ Analysis failed: {e}")
-            return False
-
-    def run_instrumentation(self) -> bool:
-        """Instrument the code"""
-        print("\nPhase 2: Instrumenting code...")
-
-        try:
-            self.instrumenter = CodeInstrumenter(self.cuda_file)
-            self.instrumenter.read_source()
-
-            # Insert optimization calls
-            instrumented = self.instrumenter.insert_optimization_calls(self.kernel_info)
-
-            # Save instrumented code
-            base_name = Path(self.cuda_file).stem
-            instrumented_file = self.output_dir / f"{base_name}_instrumented.cu"
-            self.instrumenter.save_instrumented_code(str(instrumented_file))
-
-            print(f"✓ Instrumented code saved: {instrumented_file}")
-
-            # Show what was inserted
-            print("\nInstrumentation summary:")
-            for kernel in self.kernel_info:
-                print(f"  • {kernel['name']}: Added optimization call")
-
-            return True
-
-        except Exception as e:
-            print(f"✗ Instrumentation failed: {e}")
-            import traceback
-
-            traceback.print_exc()
-            return False
-
-    def compile_instrumented_code(self) -> bool:
-        """Compile the instrumented code"""
-        print("\nPhase 3: Compiling instrumented code...")
-
-        try:
-            base_name = Path(self.cuda_file).stem
-            instrumented_file = self.output_dir / f"{base_name}_instrumented.cu"
-            output_binary = self.output_dir / f"{base_name}_instrumented"
-
-            if not instrumented_file.exists():
-                print(f"✗ Instrumented file not found: {instrumented_file}")
-                return False
-
-            success = self.instrumenter.compile_code(
-                str(instrumented_file), str(output_binary)
-            )
-
-            if success and output_binary.exists():
-                print(f"\n✓ You can run: ./{output_binary}")
-                return True
+            
+            print(f"  Dimensionality: {kernel_info['dimensionality']}D")
+            print(f"  Compute Intensity: {kernel_info['compute_intensity']:.2f} FLOPs/byte")
+            print(f"  Shared Memory: {'Yes' if kernel_info['has_shared_memory'] else 'No'}")
+            
+            # Generate candidates
+            dim = kernel_info['dimensionality']
+            if dim == 1:
+                candidates = [(32,1,1), (64,1,1), (128,1,1), (256,1,1), (512,1,1), (1024,1,1)]
             else:
-                print("\n⚠ Compilation not successful (this is OK for demo)")
-                print("  The instrumented source code is ready in output/")
-                return True  # Still consider it a success
-
-        except Exception as e:
-            print(f"⚠ Compilation error: {e}")
-            print("  (This is expected without CUDA runtime)")
-            return True  # Still OK for demo
-
-    def print_summary(self):
-        """Print final summary"""
-        print("\n" + "=" * 60)
-        print("SUMMARY")
-        print("=" * 60)
-
-        for i, kernel in enumerate(self.kernel_info, 1):
-            print(f"\n{i}. {kernel['name']}")
-            print(f"   Dimensionality: {kernel['thread_usage']['dimensionality']}D")
-            print(f"   Compute Intensity: {kernel['metrics']['compute_intensity']:.2f}")
-            print(
-                f"   Memory Accesses: {kernel['memory_access']['global_reads']}R / {kernel['memory_access']['global_writes']}W"
-            )
-            print(
-                f"   Shared Memory: {'Yes' if kernel['memory_access']['shared_memory'] else 'No'}"
-            )
-
-        print(f"\n✓ Results saved to: {self.output_dir}/")
-        print(f"  - analysis.json: Detailed kernel metrics")
-
-        base_name = Path(self.cuda_file).stem
-        instrumented_file = self.output_dir / f"{base_name}_instrumented.cu"
-        if instrumented_file.exists():
-            print(f"  - {instrumented_file.name}: Instrumented source code")
-            print(f"\nView instrumented code:")
-            print(f"  cat {instrumented_file}")
+                candidates = [
+                    (8,8,1), (16,8,1), (16,16,1), (32,8,1), (32,16,1), (32,32,1),
+                    (64,4,1), (64,8,1), (64,16,1), (128,4,1), (128,8,1), (256,4,1)
+                ]
+            
+            kernel_result = {
+                'kernel': kernel_name,
+                'dimensionality': dim,
+                'models': {}
+            }
+            
+            # Predict with each available model
+            if self.models_loaded['random_forest']:
+                print(f"\n  Random Forest predictions:")
+                rf_preds = self._predict_random_forest(kernel_info, N, candidates)
+                best_rf = rf_preds[0]
+                print(f"    Best: ({best_rf['block_x']}, {best_rf['block_y']}, {best_rf['block_z']}) → {best_rf['predicted_time']:.6f}s")
+                kernel_result['models']['random_forest'] = {
+                    'best': best_rf,
+                    'all': rf_preds[:5]
+                }
+            
+            if self.models_loaded['ensemble']:
+                print(f"\n  Ensemble DNN predictions:")
+                ens_preds = self._predict_ensemble(kernel_info, N, candidates)
+                best_ens = ens_preds[0]
+                print(f"    Best: ({best_ens['block_x']}, {best_ens['block_y']}, 1) → {best_ens['predicted_time']:.6f}s")
+                kernel_result['models']['ensemble'] = {
+                    'best': best_ens,
+                    'all': ens_preds[:5]
+                }
+            
+            if self.models_loaded['llm']:
+                print(f"\n  LLM predictions:")
+                llm_preds = self._predict_llm(kernel_info, N, candidates)
+                best_llm = llm_preds[0]
+                print(f"    Best: ({best_llm['block_x']}, {best_llm['block_y']}, {best_llm['block_z']}) → {best_llm['predicted_time']:.6f}s")
+                kernel_result['models']['llm'] = {
+                    'best': best_llm,
+                    'all': llm_preds[:5]
+                }
+            
+            results.append(kernel_result)
+        
+        return results
+    
+    def print_summary(self, results, N):
+        """Print final summary with recommendations"""
+        print(f"\n{'='*80}")
+        print(f"RECOMMENDED LAUNCH CONFIGURATIONS (N={N})")
+        print(f"{'='*80}\n")
+        
+        for result in results:
+            kernel_name = result['kernel']
+            dim = result['dimensionality']
+            
+            print(f"{kernel_name}:")
+            print(f"  Dimensionality: {dim}D\n")
+            
+            # Show recommendation from each model
+            for model_name, model_data in result['models'].items():
+                best = model_data['best']
+                bx, by = best['block_x'], best['block_y']
+                bz = best.get('block_z', 1)
+                time = best['predicted_time']
+                
+                # Compute grid
+                if dim == 1:
+                    grid = f"({(N + bx - 1) // bx}, 1, 1)"
+                else:
+                    grid = f"({(N + bx - 1) // bx}, {(N + by - 1) // by}, 1)"
+                
+                model_label = {
+                    'random_forest': 'Random Forest',
+                    'ensemble': 'Ensemble DNN',
+                    'llm': 'LLM'
+                }.get(model_name, model_name)
+                
+                print(f"  {model_label:15} → <<<{grid}, ({bx}, {by}, {bz})>>> ({time:.6f}s)")
+            
+            # Consensus recommendation
+            if len(result['models']) > 1:
+                # Use ensemble if available, otherwise RF
+                if 'ensemble' in result['models']:
+                    best = result['models']['ensemble']['best']
+                    model_used = "Ensemble DNN"
+                elif 'random_forest' in result['models']:
+                    best = result['models']['random_forest']['best']
+                    model_used = "Random Forest"
+                else:
+                    best = result['models']['llm']['best']
+                    model_used = "LLM"
+                
+                bx, by = best['block_x'], best['block_y']
+                bz = best.get('block_z', 1)
+                
+                if dim == 1:
+                    grid = f"({(N + bx - 1) // bx}, 1, 1)"
+                else:
+                    grid = f"({(N + bx - 1) // bx}, {(N + by - 1) // by}, 1)"
+                
+                print(f"\n  ⭐ RECOMMENDED (using {model_used}):")
+                print(f"     {kernel_name}<<<{grid}, ({bx}, {by}, {bz})>>>();")
+            
+            print()
 
 
 def main():
-    print("CUDA Kernel Optimizer - Code Instrumentation Demo\n")
-
-    if len(sys.argv) < 2:
-        print("Usage: python3 main.py <cuda_file.cu> [output_dir]")
-        print("\nExample:")
-        print("  python3 main.py vec_add.cu")
+    if len(sys.argv) < 3:
+        print("CUDA Kernel Launch Configuration Optimizer")
+        print("=" * 60)
+        print("\nUsage: python3 main.py <cuda_file.cu> <N>")
+        print("\nExamples:")
+        print("  python3 main.py vec_add.cu 1048576")
+        print("  python3 main.py PolybenchCUDA/stencils/convolution-2d/2DConvolution.cu 2048")
+        print("\nThis tool uses multiple ML models to suggest optimal launch configs:")
+        print("  • Random Forest (baseline)")
+        print("  • Ensemble DNNs (best accuracy)")
+        print("  • Fine-tuned LLM (if available)")
+        print()
         sys.exit(1)
-
+    
     cuda_file = sys.argv[1]
-    output_dir = sys.argv[2] if len(sys.argv) > 2 else "./"
-
-    if not os.path.exists(cuda_file):
-        print(f"Error: '{cuda_file}' not found")
+    N = int(sys.argv[2])
+    
+    try:
+        suggester = MultiModelSuggester()
+        results = suggester.suggest(cuda_file, N)
+        suggester.print_summary(results, N)
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
-
-    # Run the pipeline
-    tool = OrcMain(cuda_file, output_dir)
-
-    if not tool.run_analysis():
-        sys.exit(1)
-
-    if not tool.run_instrumentation():
-        sys.exit(1)
-
-    tool.compile_instrumented_code()
-    tool.print_summary()
-
-    print()
 
 
 if __name__ == "__main__":
