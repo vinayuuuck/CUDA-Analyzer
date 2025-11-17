@@ -5,18 +5,17 @@ import sys
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import math
+import re
 
 
 class CUDAKernelAnalyzer:
     def __init__(self, cuda_file: str):
         self.cuda_file = cuda_file
         self.kernels = []
-
-        # Initialize libclang - will auto-detect on macOS
         self.index = clang.cindex.Index.create()
 
     def parse_file(self) -> clang.cindex.TranslationUnit:
-        """Parse the CUDA file using clang"""
         args = [
             "-x",
             "cuda",
@@ -27,15 +26,13 @@ class CUDAKernelAnalyzer:
             "--no-cuda-version-check",
             "-std=c++11",
             "-Wno-everything",
-            "-fsyntax-only",  # Only parse, don't compile
-            "-I.",  # Include current directory
+            "-fsyntax-only",
+            "-I.",
         ]
 
-        # Try with resource dir to find system headers
         import platform
 
-        if platform.system() == "Darwin":  # macOS
-            # Common paths for macOS system headers
+        if platform.system() == "Darwin":
             system_includes = [
                 "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include",
                 "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include",
@@ -57,71 +54,138 @@ class CUDAKernelAnalyzer:
 
         return tu
 
+    def _get_source_from_extent(self, extent) -> str:
+        try:
+            start_line = extent.start.line
+            end_line = extent.end.line
+            with open(self.cuda_file, "r") as f:
+                lines = f.readlines()
+            return "".join(lines[max(0, start_line - 1) : end_line])
+        except Exception:
+            with open(self.cuda_file, "r") as f:
+                return f.read()
+
     def is_cuda_kernel(self, cursor) -> bool:
-        """Check if a function is a CUDA kernel (__global__)"""
-        tokens = list(cursor.get_tokens())
-        for token in tokens:
-            if token.spelling == "__global__":
+        if cursor.kind != CursorKind.FUNCTION_DECL:
+            return False
+
+        tokens = [t.spelling for t in cursor.get_tokens()]
+        if "__global__" in tokens:
+            return True
+
+        for ch in cursor.get_children():
+            try:
+                child_tokens = [t.spelling for t in ch.get_tokens()]
+                if "__global__" in child_tokens:
+                    return True
+            except Exception:
+                pass
+
+        try:
+            src = self._get_source_from_extent(cursor.extent)
+            if "__global__" in src.split("\n", 1)[0]:
                 return True
+        except Exception:
+            pass
+
         return False
 
+    def _traverse_for_memory(self, node, memory_info: Dict):
+        if node.kind == CursorKind.VAR_DECL:
+            try:
+                token_strs = [t.spelling for t in node.get_tokens()]
+                if "__shared__" in token_strs:
+                    memory_info["shared_memory"] = True
+                    memory_info["shared_arrays"].append(node.spelling)
+            except Exception:
+                pass
+
+        if node.kind == CursorKind.CALL_EXPR:
+            try:
+                tok = [t.spelling for t in node.get_tokens()]
+                if any("__syncthreads" == s or "syncthreads" in s for s in tok):
+                    memory_info["uses_syncthreads"] = True
+            except Exception:
+                pass
+
+        if node.kind == CursorKind.ARRAY_SUBSCRIPT_EXPR:
+            try:
+                children = list(node.get_children())
+                arr = children[0].spelling if children else "unknown"
+                memory_info["array_accesses"].append(
+                    {
+                        "line": node.location.line,
+                        "array": arr,
+                    }
+                )
+            except Exception:
+                pass
+
+        for child in node.get_children():
+            self._traverse_for_memory(child, memory_info)
+
     def analyze_memory_accesses(self, cursor) -> Dict:
-        """Analyze memory access patterns in the kernel"""
         memory_info = {
             "global_reads": 0,
             "global_writes": 0,
             "shared_memory": False,
             "shared_arrays": [],
             "array_accesses": [],
+            "uses_syncthreads": False,
         }
 
-        # Get source text for simpler pattern matching
-        import re
-        tokens = list(cursor.get_tokens())
-        source_text = " ".join([t.spelling for t in tokens])
-        
-        # Count array writes: pattern like "array[index] ="
-        write_pattern = r'\w+\s*\[\s*[^\]]+\s*\]\s*='
+        tokens = [t.spelling for t in cursor.get_tokens()]
+        source_text = " ".join(tokens)
+
+        write_pattern = r"\w+\s*\[\s*[^\]]+\s*\]\s*(?:=|\+=|-=|\*=|/=)"
         writes = re.findall(write_pattern, source_text)
         memory_info["global_writes"] = len(writes)
-        
-        # Count all array accesses
-        array_pattern = r'\w+\s*\[\s*[^\]]+\s*\]'
+
+        array_pattern = r"\w+\s*\[\s*[^\]]+\s*\]"
         all_accesses = re.findall(array_pattern, source_text)
-        
-        # Reads = total accesses - writes
         memory_info["global_reads"] = max(len(all_accesses) - len(writes), 0)
 
-        def visit_node(node):
-            # Check for shared memory declarations
-            if node.kind == CursorKind.VAR_DECL:
-                tokens = list(node.get_tokens())
-                token_strs = [t.spelling for t in tokens]
-                if "__shared__" in token_strs:
-                    memory_info["shared_memory"] = True
-                    memory_info["shared_arrays"].append(node.spelling)
+        self._traverse_for_memory(cursor, memory_info)
 
-            # Collect detailed array access info
-            if node.kind == CursorKind.ARRAY_SUBSCRIPT_EXPR:
-                memory_info["array_accesses"].append(
-                    {
-                        "line": node.location.line,
-                        "array": (
-                            list(node.get_children())[0].spelling
-                            if list(node.get_children())
-                            else "unknown"
-                        ),
-                    }
-                )
-
-            for child in node.get_children():
-                visit_node(child)
-
-        visit_node(cursor)
         return memory_info
 
+    def _traverse_and_count_ops(self, node, ops: Dict):
+        if node.kind == CursorKind.BINARY_OPERATOR:
+            ops["arithmetic"] += 1
+        elif node.kind == CursorKind.UNARY_OPERATOR:
+            ops["arithmetic"] += 1
+        elif node.kind in [CursorKind.ARRAY_SUBSCRIPT_EXPR, CursorKind.MEMBER_REF_EXPR]:
+            ops["memory"] += 1
+        elif node.kind in [CursorKind.IF_STMT, CursorKind.SWITCH_STMT]:
+            ops["control_flow"] += 1
+        elif node.kind in [
+            CursorKind.FOR_STMT,
+            CursorKind.WHILE_STMT,
+            CursorKind.DO_STMT,
+        ]:
+            ops["loops"] += 1
+
+        for child in node.get_children():
+            self._traverse_and_count_ops(child, ops)
+
+    def count_operations(self, cursor) -> Dict:
+        ops = {"arithmetic": 0, "memory": 0, "control_flow": 0, "loops": 0}
+        self._traverse_and_count_ops(cursor, ops)
+        return ops
+
+    def extract_kernel_parameters(self, cursor) -> List[Dict]:
+        params = []
+        for arg in cursor.get_arguments():
+            param_info = {
+                "name": arg.spelling,
+                "type": arg.type.spelling,
+                "is_pointer": arg.type.kind == TypeKind.POINTER,
+                "is_const": arg.type.is_const_qualified(),
+            }
+            params.append(param_info)
+        return params
+
     def analyze_thread_indexing(self, cursor) -> Dict:
-        """Analyze how thread indices are used"""
         thread_info = {
             "uses_threadIdx_x": False,
             "uses_threadIdx_y": False,
@@ -135,23 +199,37 @@ class CUDAKernelAnalyzer:
             "dimensionality": 1,
         }
 
-        # Also get all tokens from the function to catch cases where
-        # clang doesn't parse threadIdx/blockIdx as expected
-        all_tokens = list(cursor.get_tokens())
-        source_text = " ".join([t.spelling for t in all_tokens])
-        
-        # Direct text search as backup
-        thread_info["uses_threadIdx_x"] = "threadIdx.x" in source_text or "threadIdx . x" in source_text
-        thread_info["uses_threadIdx_y"] = "threadIdx.y" in source_text or "threadIdx . y" in source_text
-        thread_info["uses_threadIdx_z"] = "threadIdx.z" in source_text or "threadIdx . z" in source_text
-        thread_info["uses_blockIdx_x"] = "blockIdx.x" in source_text or "blockIdx . x" in source_text
-        thread_info["uses_blockIdx_y"] = "blockIdx.y" in source_text or "blockIdx . y" in source_text
-        thread_info["uses_blockIdx_z"] = "blockIdx.z" in source_text or "blockIdx . z" in source_text
-        thread_info["uses_blockDim_x"] = "blockDim.x" in source_text or "blockDim . x" in source_text
-        thread_info["uses_blockDim_y"] = "blockDim.y" in source_text or "blockDim . y" in source_text
-        thread_info["uses_blockDim_z"] = "blockDim.z" in source_text or "blockDim . z" in source_text
+        all_tokens = [t.spelling for t in cursor.get_tokens()]
+        source_text = " ".join(all_tokens)
 
-        # Determine dimensionality
+        thread_info["uses_threadIdx_x"] = (
+            "threadIdx.x" in source_text or "threadIdx . x" in source_text
+        )
+        thread_info["uses_threadIdx_y"] = (
+            "threadIdx.y" in source_text or "threadIdx . y" in source_text
+        )
+        thread_info["uses_threadIdx_z"] = (
+            "threadIdx.z" in source_text or "threadIdx . z" in source_text
+        )
+        thread_info["uses_blockIdx_x"] = (
+            "blockIdx.x" in source_text or "blockIdx . x" in source_text
+        )
+        thread_info["uses_blockIdx_y"] = (
+            "blockIdx.y" in source_text or "blockIdx . y" in source_text
+        )
+        thread_info["uses_blockIdx_z"] = (
+            "blockIdx.z" in source_text or "blockIdx . z" in source_text
+        )
+        thread_info["uses_blockDim_x"] = (
+            "blockDim.x" in source_text or "blockDim . x" in source_text
+        )
+        thread_info["uses_blockDim_y"] = (
+            "blockDim.y" in source_text or "blockDim . y" in source_text
+        )
+        thread_info["uses_blockDim_z"] = (
+            "blockDim.z" in source_text or "blockDim . z" in source_text
+        )
+
         if thread_info["uses_threadIdx_z"] or thread_info["uses_blockIdx_z"]:
             thread_info["dimensionality"] = 3
         elif thread_info["uses_threadIdx_y"] or thread_info["uses_blockIdx_y"]:
@@ -161,50 +239,41 @@ class CUDAKernelAnalyzer:
 
         return thread_info
 
-    def count_operations(self, cursor) -> Dict:
-        """Count arithmetic and logical operations"""
-        ops = {"arithmetic": 0, "memory": 0, "control_flow": 0, "loops": 0}
+    def estimate_compute_intensity(self, cursor, memory_info: Dict, ops: Dict) -> Dict:
+        tokens = [t.spelling for t in cursor.get_tokens()]
+        src_text = " ".join(tokens)
 
-        def visit_node(node):
-            if node.kind == CursorKind.BINARY_OPERATOR:
-                ops["arithmetic"] += 1
-            elif node.kind == CursorKind.UNARY_OPERATOR:
-                ops["arithmetic"] += 1
-            elif node.kind in [
-                CursorKind.ARRAY_SUBSCRIPT_EXPR,
-                CursorKind.MEMBER_REF_EXPR,
-            ]:
-                ops["memory"] += 1
-            elif node.kind in [CursorKind.IF_STMT, CursorKind.SWITCH_STMT]:
-                ops["control_flow"] += 1
-            elif node.kind in [
-                CursorKind.FOR_STMT,
-                CursorKind.WHILE_STMT,
-                CursorKind.DO_STMT,
-            ]:
-                ops["loops"] += 1
+        mul_div_count = tokens.count("*") + tokens.count("/")
+        add_sub_count = tokens.count("+") + tokens.count("-")
 
-            for child in node.get_children():
-                visit_node(child)
+        estimated_flops = ops.get("arithmetic", 0) + 2 * mul_div_count + add_sub_count
 
-        visit_node(cursor)
-        return ops
+        bytes_per_element = 4
+        if re.search(r"\bdouble\b", src_text) or any(
+            "double" in p["type"] for p in self.extract_kernel_parameters(cursor)
+        ):
+            bytes_per_element = 8
 
-    def extract_kernel_parameters(self, cursor) -> List[Dict]:
-        """Extract kernel function parameters"""
-        params = []
-        for arg in cursor.get_arguments():
-            param_info = {
-                "name": arg.spelling,
-                "type": arg.type.spelling,
-                "is_pointer": arg.type.kind == TypeKind.POINTER,
-                "is_const": arg.type.is_const_qualified(),
-            }
-            params.append(param_info)
-        return params
+        total_mem_accesses = max(
+            memory_info.get("global_reads", 0) + memory_info.get("global_writes", 0), 1
+        )
+        estimated_memory_bytes = total_mem_accesses * bytes_per_element
+
+        compute_intensity = estimated_flops / max(estimated_memory_bytes, 1)
+
+        return {
+            "estimated_flops": int(estimated_flops),
+            "estimated_memory_bytes": int(estimated_memory_bytes),
+            "flops_per_byte": float(compute_intensity),
+        }
 
     def analyze_kernel(self, cursor) -> Dict:
-        """Perform complete analysis of a kernel"""
+        params = self.extract_kernel_parameters(cursor)
+        thread_usage = self.analyze_thread_indexing(cursor)
+        memory_access = self.analyze_memory_accesses(cursor)
+        operations = self.count_operations(cursor)
+        metrics = self.estimate_compute_intensity(cursor, memory_access, operations)
+
         kernel_info = {
             "name": cursor.spelling,
             "location": {
@@ -213,33 +282,27 @@ class CUDAKernelAnalyzer:
                 ),
                 "line": cursor.location.line,
             },
-            "parameters": self.extract_kernel_parameters(cursor),
-            "thread_usage": self.analyze_thread_indexing(cursor),
-            "memory_access": self.analyze_memory_accesses(cursor),
-            "operations": self.count_operations(cursor),
-        }
-
-        # Calculate complexity metrics
-        kernel_info["metrics"] = {
-            "compute_intensity": kernel_info["operations"]["arithmetic"]
-            / max(
-                kernel_info["memory_access"]["global_reads"]
-                + kernel_info["memory_access"]["global_writes"],
-                1,
-            ),
-            "has_shared_memory": kernel_info["memory_access"]["shared_memory"],
-            "dimensionality": kernel_info["thread_usage"]["dimensionality"],
+            "parameters": params,
+            "thread_usage": thread_usage,
+            "memory_access": memory_access,
+            "operations": operations,
+            "metrics": {
+                "compute_intensity_flops_per_byte": metrics["flops_per_byte"],
+                "estimated_flops": metrics["estimated_flops"],
+                "estimated_memory_bytes": metrics["estimated_memory_bytes"],
+                "has_shared_memory": memory_access["shared_memory"],
+                "dimensionality": thread_usage["dimensionality"],
+                "uses_syncthreads": memory_access.get("uses_syncthreads", False),
+            },
         }
 
         return kernel_info
 
     def analyze(self) -> List[Dict]:
-        """Main analysis function"""
         try:
             tu = self.parse_file()
         except Exception as e:
             print(f"Warning: Parse failed ({e}), trying fallback method...")
-            # Fallback: use regex to find kernels
             return self._fallback_analysis()
 
         def visit_cursor(cursor):
@@ -260,49 +323,49 @@ class CUDAKernelAnalyzer:
         return self.kernels
 
     def _fallback_analysis(self) -> List[Dict]:
-        """Fallback method using regex when clang parsing fails"""
-        import re
-
         with open(self.cuda_file, "r") as f:
             content = f.read()
 
-        # Find __global__ functions with their bodies
-        # Match: __global__ void kernelName(...) { ... }
-        pattern = r"__global__\s+\w+\s+(\w+)\s*\([^)]*\)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\}"
+        pattern = (
+            r"__global__\s+\w+\s+(\w+)\s*\([^)]*\)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\}"
+        )
         matches = re.finditer(pattern, content, re.DOTALL)
 
         for match in matches:
             kernel_name = match.group(1)
             kernel_body = match.group(2) if len(match.groups()) > 1 else match.group(0)
-            
-            # Analyze this specific kernel's body
+
             uses_threadIdx_x = "threadIdx.x" in kernel_body
             uses_threadIdx_y = "threadIdx.y" in kernel_body
             uses_threadIdx_z = "threadIdx.z" in kernel_body
             uses_blockIdx_x = "blockIdx.x" in kernel_body
             uses_blockIdx_y = "blockIdx.y" in kernel_body
             uses_blockIdx_z = "blockIdx.z" in kernel_body
-            
-            # Determine dimensionality from this kernel only
+
             if uses_threadIdx_z or uses_blockIdx_z:
                 dimensionality = 3
             elif uses_threadIdx_y or uses_blockIdx_y:
                 dimensionality = 2
             else:
                 dimensionality = 1
-            
-            # Count operations in this kernel body
+
             array_accesses = kernel_body.count("[")
-            arithmetic_ops = kernel_body.count("+") + kernel_body.count("-") + kernel_body.count("*") + kernel_body.count("/")
-            
-            # Estimate reads vs writes (assignments with = typically mean writes)
-            # Count array accesses on left side of = as writes
-            write_count = len(re.findall(r'\w+\[[^\]]+\]\s*=', kernel_body))
+            arithmetic_ops = (
+                kernel_body.count("+")
+                + kernel_body.count("-")
+                + kernel_body.count("*")
+                + kernel_body.count("/")
+            )
+
+            write_count = len(re.findall(r"\w+\[[^\]]+\]\s*=", kernel_body))
             read_count = max(array_accesses - write_count, 1)
-            
+
             has_shared = "__shared__" in kernel_body
-            
-            # Create minimal kernel info
+            uses_syncthreads = (
+                "__syncthreads" in kernel_body or "syncthreads" in kernel_body
+            )
+
+            total_memory_ops = read_count + max(write_count, 1)
             kernel_info = {
                 "name": kernel_name,
                 "location": {
@@ -324,6 +387,7 @@ class CUDAKernelAnalyzer:
                     "global_writes": max(write_count, 1),
                     "shared_memory": has_shared,
                     "shared_arrays": [],
+                    "uses_syncthreads": uses_syncthreads,
                 },
                 "operations": {
                     "arithmetic": arithmetic_ops,
@@ -332,36 +396,37 @@ class CUDAKernelAnalyzer:
                     "loops": kernel_body.count("for") + kernel_body.count("while"),
                 },
             }
-            
-            # Calculate compute intensity
-            total_memory_ops = read_count + max(write_count, 1)
+
+            bytes_per_element = 8 if "double" in kernel_body else 4
+            estimated_flops = arithmetic_ops
+            estimated_memory_bytes = total_memory_ops * bytes_per_element
             kernel_info["metrics"] = {
-                "compute_intensity": arithmetic_ops / total_memory_ops if total_memory_ops > 0 else 1.0,
+                "compute_intensity_flops_per_byte": estimated_flops
+                / max(estimated_memory_bytes, 1),
+                "estimated_flops": estimated_flops,
+                "estimated_memory_bytes": estimated_memory_bytes,
                 "has_shared_memory": has_shared,
                 "dimensionality": dimensionality,
+                "uses_syncthreads": uses_syncthreads,
             }
-            
+
             self.kernels.append(kernel_info)
 
         return self.kernels
 
     def generate_report(self, output_file: Optional[str] = None):
-        """Generate a detailed analysis report"""
         report = {
             "source_file": self.cuda_file,
             "num_kernels": len(self.kernels),
             "kernels": self.kernels,
         }
-
         if output_file:
             with open(output_file, "w") as f:
                 json.dump(report, f, indent=2)
             print(f"Report saved to {output_file}")
-
         return report
 
     def print_summary(self):
-        """Print a human-readable summary"""
         print(f"\n{'='*60}")
         print(f"CUDA Kernel Analysis Report")
         print(f"{'='*60}")
@@ -373,20 +438,28 @@ class CUDAKernelAnalyzer:
             print(f"  Location: Line {kernel['location']['line']}")
             print(f"  Parameters: {len(kernel['parameters'])}")
             print(f"  Dimensionality: {kernel['thread_usage']['dimensionality']}D")
+            ma = kernel["memory_access"]
             print(
-                f"  Memory accesses: {kernel['memory_access']['global_reads']} reads, {kernel['memory_access']['global_writes']} writes"
+                f"  Memory accesses: {ma['global_reads']} reads, {ma['global_writes']} writes"
+            )
+            print(f"  Shared memory: {'Yes' if ma['shared_memory'] else 'No'}")
+            print(
+                f"  Uses __syncthreads(): {'Yes' if kernel['metrics'].get('uses_syncthreads') else 'No'}"
             )
             print(
-                f"  Shared memory: {'Yes' if kernel['memory_access']['shared_memory'] else 'No'}"
+                f"  Compute intensity (FLOPs/byte): {kernel['metrics']['compute_intensity_flops_per_byte']:.4f}"
             )
-            print(f"  Compute intensity: {kernel['metrics']['compute_intensity']:.2f}")
+            print(f"  Estimated FLOPs: {kernel['metrics']['estimated_flops']}")
+            print(
+                f"  Estimated memory bytes: {kernel['metrics']['estimated_memory_bytes']}"
+            )
             print(f"  Operations: {kernel['operations']}")
             print()
 
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 cuda_analyzer.py <cuda_file.cu> [output.json]")
+        print("Usage: python3 cuda_anal.py <cuda_file.cu> [output.json]")
         sys.exit(1)
 
     cuda_file = sys.argv[1]
