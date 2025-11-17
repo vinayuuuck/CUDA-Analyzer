@@ -7,6 +7,10 @@ Architecture:
 - Slow model: exec_time ≥ 100ms (memory/large problem dominated)
 """
 
+import math
+import os
+import re
+import statistics
 import pandas as pd
 import numpy as np
 import pickle
@@ -447,7 +451,9 @@ class EnsemblePredictor:
                     "loop_ops": kernel_info.get("loop_ops", 0),
                     "uses_syncthreads": kernel_info.get("uses_syncthreads", 0),
                     "estimated_flops": kernel_info.get("estimated_flops", 0),
-                    "estimated_memory_bytes": kernel_info.get("estimated_memory_bytes", 0),
+                    "estimated_memory_bytes": kernel_info.get(
+                        "estimated_memory_bytes", 0
+                    ),
                     "uses_threadIdx_x": kernel_info.get("uses_threadIdx_x", 0),
                     "uses_threadIdx_y": kernel_info.get("uses_threadIdx_y", 0),
                     "uses_threadIdx_z": kernel_info.get("uses_threadIdx_z", 0),
@@ -540,58 +546,179 @@ class EnsemblePredictor:
         return best["block_x"], best["block_y"], best["predicted_time"], predictions
 
 
-def analyze_cuda_file_and_predict(cuda_file, N, ensemble, output_dir="ensemble_models"):
+def grid_from_block_and_problem(block_x, block_y, problem_shape, dimensionality=1):
+    """Return (grid_x, grid_y, grid_z) that cover problem_shape with block dims."""
+    if dimensionality == 1:
+        N = int(problem_shape)
+        gx = max(1, math.ceil(N / block_x))
+        return (gx, 1, 1)
+    elif dimensionality == 2:
+        Nx, Ny = problem_shape
+        gx = max(1, math.ceil(Nx / block_x))
+        gy = max(1, math.ceil(Ny / block_y))
+        return (gx, gy, 1)
+    elif dimensionality == 3:
+        Nx, Ny, Nz = problem_shape
+        gz = max(1, math.ceil(Nz / 1))
+        return (max(1, math.ceil(Nx / block_x)), max(1, math.ceil(Ny / block_y)), gz)
+    return (1, 1, 1)
+
+
+def grid_for_saturation(block_x, block_y, device_profile=None, target_blocks_per_sm=8):
     """
-    Analyze a CUDA source file and predict optimal configs for all kernels
-    
-    Args:
-        cuda_file: Path to .cu file
-        N: Problem size to optimize for
-        ensemble: EnsemblePredictor instance
-        output_dir: Directory with trained models
+    Create a grid intended to saturate the device if problem size unknown.
+    device_profile example: {'sm_count': 80, 'max_grid_x': 2**31-1, 'max_grid_y': 65535}
+    """
+    if device_profile is None:
+        device_profile = {"sm_count": 80, "max_grid_x": 2**31 - 1, "max_grid_y": 65535}
+
+    sm = int(device_profile.get("sm_count", 80))
+    max_gx = int(device_profile.get("max_grid_x", 2**31 - 1))
+    max_gy = int(device_profile.get("max_grid_y", 65535))
+
+    target_blocks = sm * int(target_blocks_per_sm)
+    for gy in (1, 2, 4, 8):
+        gx = math.ceil(target_blocks / gy)
+        if gx <= max_gx and gy <= max_gy:
+            return (min(gx, max_gx), min(gy, max_gy), 1)
+    return (min(target_blocks, max_gx), 1, 1)
+
+
+def find_literal_in_file(cuda_file: str, var_names=("N", "n", "nx", "ny")):
+    """Search for common literal defines/assignments in the source. Returns dict var->int."""
+    res = {}
+    if not cuda_file or not os.path.exists(cuda_file):
+        return res
+    try:
+        text = open(cuda_file, "r", encoding="utf-8", errors="ignore").read()
+    except:
+        return res
+    # #define N 1024
+    for name in var_names:
+        m = re.search(rf"#\s*define\s+{re.escape(name)}\s+([0-9]+)", text)
+        if m:
+            res[name] = int(m.group(1))
+    # simple typed literal: int N = 1024;
+    for name in var_names:
+        m = re.search(
+            rf"\b(?:int|long|size_t|unsigned|unsigned\s+int)\s+{re.escape(name)}\s*=\s*([0-9]+)\b",
+            text,
+        )
+        if m:
+            res.setdefault(name, int(m.group(1)))
+    # simple assignment N = 1024;
+    for name in var_names:
+        m = re.search(rf"\b{re.escape(name)}\s*=\s*([0-9]+)\s*;", text)
+        if m:
+            res.setdefault(name, int(m.group(1)))
+    return res
+
+
+def get_candidate_problem_sizes(
+    kernel_name: str, cuda_file: str = None, history_csv: str = None, top_k=3
+):
+    """
+    Return a list of candidate N values (ints).
+    Priority:
+      1) historic values from history_csv for this kernel (if available)
+      2) literal values found in the cuda_file (#define/assignments)
+      3) fallback list [256,512,1024,2048,4096]
+    """
+    # 1) historic CSV
+    if history_csv and os.path.exists(history_csv):
+        try:
+            df = pd.read_csv(history_csv)
+            if "kernel" in df.columns:
+                kcol = "kernel"
+            elif "kernel_name" in df.columns:
+                kcol = "kernel_name"
+            else:
+                kcol = None
+            if kcol is not None and "N" in df.columns:
+                rows = df[df[kcol] == kernel_name]
+                if len(rows) >= 1:
+                    vals = rows["N"].dropna().astype(int).values
+                    if len(vals) > 0:
+                        med = int(statistics.median(vals))
+                        uniq = sorted(set(vals))
+                        uniq_sorted = sorted(uniq, key=lambda x: abs(x - med))
+                        return sorted(uniq_sorted[:top_k])
+        except Exception:
+            pass
+
+    # 2) try source literal
+    if cuda_file:
+        literals = find_literal_in_file(cuda_file)
+        if literals:
+            for key in ("N", "n"):
+                if key in literals:
+                    return [literals[key]]
+            if "nx" in literals:
+                return [literals.get("nx")]
+    # 3) fallback
+    return [256, 512, 1024, 2048, 4096]
+
+
+# ------------------------------------------------
+# Updated analyze function (optional N)
+# ------------------------------------------------
+def analyze_cuda_file_and_predict(
+    cuda_file,
+    ensemble,
+    N=None,
+    history_csv="klaraptor_enriched_data.csv",
+    device_profile=None,
+):
+    """
+    Analyze a CUDA source file and predict optimal configs for all kernels.
+    - If N is provided (int): evaluate only that problem size.
+    - If N is None: we call get_candidate_problem_sizes(...) to get plausible Ns,
+      evaluate for each, and pick best overall.
+    Returns results list; each entry contains per-N results + best-overall.
     """
     from cuda_anal import CUDAKernelAnalyzer
     import os
-    
+
     if not os.path.exists(cuda_file):
         print(f"Error: File '{cuda_file}' not found")
-        return
-    
+        return []
+
     print("=" * 80)
     print(f"ANALYZING CUDA FILE: {cuda_file}")
     print("=" * 80)
-    
-    # Analyze the CUDA file
+
     analyzer = CUDAKernelAnalyzer(cuda_file)
     kernels = analyzer.analyze()
-    
+
     if not kernels:
         print("No CUDA kernels found in file!")
-        return
-    
+        return []
+
     print(f"\nFound {len(kernels)} kernel(s)\n")
-    
-    # Predict optimal config for each kernel
-    results = []
-    
+
+    results_all_kernels = []
+
     for i, kernel_data in enumerate(kernels, 1):
         kernel_name = kernel_data["name"]
         print(f"\n{'='*80}")
         print(f"KERNEL #{i}: {kernel_name}")
         print(f"{'='*80}")
-        
-        # Extract features from cuda_anal
+
         metrics = kernel_data["metrics"]
         memory = kernel_data["memory_access"]
         ops = kernel_data["operations"]
         thread_usage = kernel_data["thread_usage"]
-        
-        kernel_info = {
+
+        # Prepare base kernel_info (will mutate N as we test candidates)
+        base_kernel_info = {
             "kernel_name": kernel_name,
-            "N": N,
-            "dimensionality": metrics.get("dimensionality", thread_usage.get("dimensionality", 1)),
+            "dimensionality": metrics.get(
+                "dimensionality", thread_usage.get("dimensionality", 1)
+            ),
             "compute_intensity": metrics.get("compute_intensity", 1.0),
-            "has_shared_memory": int(metrics.get("has_shared_memory", memory.get("shared_memory", False))),
+            "has_shared_memory": int(
+                metrics.get("has_shared_memory", memory.get("shared_memory", False))
+            ),
             "global_reads": memory.get("global_reads", 10),
             "global_writes": memory.get("global_writes", 5),
             "arithmetic_ops": ops.get("arithmetic", 100),
@@ -606,81 +733,111 @@ def analyze_cuda_file_and_predict(cuda_file, N, ensemble, output_dir="ensemble_m
             "uses_threadIdx_z": int(thread_usage.get("uses_threadIdx_z", False)),
             "uses_blockIdx_x": int(thread_usage.get("uses_blockIdx_x", False)),
             "uses_blockIdx_y": int(thread_usage.get("uses_blockIdx_y", False)),
-            "uses_blockIdx_z": int(thread_usage.get("uses_blockIdx_z", False)),
             "uses_blockDim_x": int(thread_usage.get("uses_blockDim_x", False)),
             "uses_blockDim_y": int(thread_usage.get("uses_blockDim_y", False)),
-            "uses_blockDim_z": int(thread_usage.get("uses_blockDim_z", False)),
         }
-        
-        # Print kernel characteristics
-        print(f"  Location: Line {kernel_data['location']['line']}")
-        print(f"  Dimensionality: {kernel_info['dimensionality']}D")
-        print(f"  Compute Intensity: {kernel_info['compute_intensity']:.2f} FLOPs/byte")
-        print(f"  Memory: {kernel_info['global_reads']} reads, {kernel_info['global_writes']} writes")
-        print(f"  Shared Memory: {'Yes' if kernel_info['has_shared_memory'] else 'No'}")
-        print(f"  Operations: {kernel_info['arithmetic_ops']} arithmetic, {kernel_info['control_flow_ops']} control flow")
-        
-        # Predict optimal configuration
-        print(f"\n  Optimizing for N={N}...")
-        bx, by, pred_time, all_preds = ensemble.predict_optimal_config(kernel_info)
-        
-        # Compute grid dimensions
-        dim = kernel_info['dimensionality']
-        if dim == 1:
-            grid_x = (N + bx - 1) // bx
-            grid_dims = f"({grid_x}, 1, 1)"
-        elif dim == 2:
-            grid_x = (N + bx - 1) // bx
-            grid_y = (N + by - 1) // by
-            grid_dims = f"({grid_x}, {grid_y}, 1)"
-        else:  # 3D
-            grid_x = (N + bx - 1) // bx
-            grid_y = (N + by - 1) // by
-            grid_z = 1
-            grid_dims = f"({grid_x}, {grid_y}, {grid_z})"
-        
-        print(f"\n  ✓ OPTIMAL LAUNCH CONFIGURATION:")
-        print(f"      Block dims:  ({bx}, {by}, 1)")
-        print(f"      Grid dims:   {grid_dims}")
-        print(f"      Total threads: {bx * by}")
-        print(f"      Predicted time: {pred_time:.6f} ms")
-        
-        print(f"\n  Top 5 configurations:")
-        for pred in sorted(all_preds, key=lambda x: x["predicted_time"])[:5]:
-            bx_alt = pred['block_x']
-            by_alt = pred['block_y']
+
+        # resolve candidate Ns
+        if N is not None:
+            candidate_Ns = [int(N)]
+        else:
+            candidate_Ns = get_candidate_problem_sizes(
+                kernel_name, cuda_file=cuda_file, history_csv=history_csv
+            )
+
+        print(f"  Candidate problem sizes to evaluate: {candidate_Ns}")
+
+        per_N_results = []
+
+        for Ncand in candidate_Ns:
+            kernel_info = base_kernel_info.copy()
+            kernel_info["N"] = int(Ncand)
+
+            # Predict best block using ensemble
+            bx, by, pred_time, all_preds = ensemble.predict_optimal_config(kernel_info)
+
+            # compute grid dims deterministically (if we have an Nx,Ny convention adapt here)
+            dim = kernel_info["dimensionality"]
             if dim == 1:
-                gx = (N + bx_alt - 1) // bx_alt
-                grid_str = f"grid=({gx},1,1)"
+                grid = grid_from_block_and_problem(
+                    bx, by, kernel_info["N"], dimensionality=1
+                )
+            elif dim == 2:
+                # assume square domain if only one N provided
+                grid = grid_from_block_and_problem(
+                    bx, by, (kernel_info["N"], kernel_info["N"]), dimensionality=2
+                )
             else:
-                gx = (N + bx_alt - 1) // bx_alt
-                gy = (N + by_alt - 1) // by_alt
-                grid_str = f"grid=({gx},{gy},1)"
-            print(f"      block=({bx_alt:4d}, {by_alt:4d}, 1)  {grid_str}  →  {pred['predicted_time']:.6f} ms")
-        
-        # Store result
-        results.append({
-            "kernel": kernel_name,
-            "block_x": bx,
-            "block_y": by,
-            "block_z": 1,
-            "grid_dims": grid_dims,
-            "predicted_time": pred_time,
-            "dimensionality": dim
-        })
-    
-    # Summary
+                grid = grid_from_block_and_problem(
+                    bx, by, (kernel_info["N"], kernel_info["N"], 1), dimensionality=3
+                )
+
+            grid_dims = f"({grid[0]}, {grid[1]}, {grid[2]})"
+
+            per_N_results.append(
+                {
+                    "N": Ncand,
+                    "block_x": bx,
+                    "block_y": by,
+                    "block_z": 1,
+                    "grid_dims": grid_dims,
+                    "predicted_time": pred_time,
+                    "all_preds": all_preds,
+                }
+            )
+
+        # Best overall by predicted_time across all candidate Ns
+        best_overall = min(per_N_results, key=lambda r: r["predicted_time"])
+
+        # If there was no meaningful candidate (shouldn't happen), fallback to saturation heuristic
+        if not per_N_results:
+            # pick a default block and a saturation grid
+            default_block = (128, 8)
+            grid_sat = grid_for_saturation(
+                default_block[0], default_block[1], device_profile=device_profile
+            )
+            best_overall = {
+                "N": None,
+                "block_x": default_block[0],
+                "block_y": default_block[1],
+                "block_z": 1,
+                "grid_dims": f"({grid_sat[0]}, {grid_sat[1]}, {grid_sat[2]})",
+                "predicted_time": None,
+                "all_preds": [],
+            }
+
+        # Print per-N summary
+        print(f"\nPer-candidate results for kernel '{kernel_name}':")
+        for r in per_N_results:
+            print(
+                f"  N={r['N']:8d}  block=({r['block_x']:4d},{r['block_y']:4d},1)  grid={r['grid_dims']}  pred={r['predicted_time']:.6f} ms"
+            )
+
+        print("\nBest overall:")
+        print(
+            f"  N={best_overall['N']}  block=({best_overall['block_x']},{best_overall['block_y']},1)  grid={best_overall['grid_dims']}  pred={best_overall['predicted_time']:.6f} ms"
+        )
+
+        results_all_kernels.append(
+            {
+                "kernel": kernel_name,
+                "per_N_results": per_N_results,
+                "best_overall": best_overall,
+                "dimensionality": base_kernel_info["dimensionality"],
+            }
+        )
+
+    # final summary
     print("\n" + "=" * 80)
     print("SUMMARY - RECOMMENDED LAUNCH CONFIGURATIONS")
     print("=" * 80)
-    print(f"Problem size: N={N}\n")
-    
-    for result in results:
-        print(f"{result['kernel']:<30}")
-        print(f"  Launch: <<<{result['grid_dims']}, ({result['block_x']}, {result['block_y']}, {result['block_z']})>>>")
-        print(f"  Predicted time: {result['predicted_time']:.6f} ms\n")
-    
-    return results
+    for res in results_all_kernels:
+        bo = res["best_overall"]
+        print(
+            f"{res['kernel']:<30}  N={bo['N']:>6}  <<<{bo['grid_dims']} , ({bo['block_x']}, {bo['block_y']}, {bo['block_z']})>>>  pred={bo['predicted_time']:.6f} ms"
+        )
+
+    return results_all_kernels
 
 
 def main():
@@ -699,15 +856,19 @@ Examples:
   
   # Analyze all kernels in a file for different problem sizes
   python3 ensemble_exec_time_predictor.py --predict --cuda-file 2DConvolution.cu --N 2048
-        """
+        """,
     )
-    parser.add_argument("csv_file", nargs="?", help="Path to enriched CSV (for training)")
+    parser.add_argument(
+        "csv_file", nargs="?", help="Path to enriched CSV (for training)"
+    )
     parser.add_argument("--train", action="store_true", help="Train all models")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--output-dir", default="ensemble_models")
 
     # Prediction mode - now accepts CUDA file
-    parser.add_argument("--predict", action="store_true", help="Predict optimal configs")
+    parser.add_argument(
+        "--predict", action="store_true", help="Predict optimal configs"
+    )
     parser.add_argument("--cuda-file", help="Path to CUDA source file (.cu)")
     parser.add_argument("--N", type=int, help="Problem size")
 
@@ -770,14 +931,12 @@ Examples:
     elif args.predict:
         if not args.cuda_file:
             parser.error("Prediction requires: --cuda-file")
-        if not args.N:
-            parser.error("Prediction requires: --N (problem size)")
 
         # Load trained ensemble
         ensemble = EnsemblePredictor(args.output_dir)
-        
+
         # Analyze CUDA file and predict for all kernels
-        analyze_cuda_file_and_predict(args.cuda_file, args.N, ensemble, args.output_dir)
+        analyze_cuda_file_and_predict(args.cuda_file, ensemble, args.N, args.output_dir)
 
     else:
         parser.print_help()

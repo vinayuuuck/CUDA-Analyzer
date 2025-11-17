@@ -391,9 +391,10 @@ def add_kernel_features(
                     break
             if kernel_info:
                 # Extract compute intensity - check both old and new key names
-                compute_intensity = kernel_info["metrics"].get("compute_intensity") or \
-                                  kernel_info["metrics"].get("compute_intensity_flops_per_byte", 0)
-                
+                compute_intensity = kernel_info["metrics"].get(
+                    "compute_intensity"
+                ) or kernel_info["metrics"].get("compute_intensity_flops_per_byte", 0)
+
                 kernel_features[kernel_name] = {
                     "dimensionality": kernel_info["thread_usage"]["dimensionality"],
                     "compute_intensity": compute_intensity,
@@ -405,21 +406,45 @@ def add_kernel_features(
                     "arithmetic_ops": kernel_info["operations"]["arithmetic"],
                     "memory_ops": kernel_info["operations"]["memory"],
                     # New metrics from cuda_anal.py
-                    "control_flow_ops": kernel_info["operations"].get("control_flow", 0),
+                    "control_flow_ops": kernel_info["operations"].get(
+                        "control_flow", 0
+                    ),
                     "loop_ops": kernel_info["operations"].get("loops", 0),
-                    "uses_syncthreads": int(kernel_info["metrics"].get("uses_syncthreads", False)),
+                    "uses_syncthreads": int(
+                        kernel_info["metrics"].get("uses_syncthreads", False)
+                    ),
                     "estimated_flops": kernel_info["metrics"].get("estimated_flops", 0),
-                    "estimated_memory_bytes": kernel_info["metrics"].get("estimated_memory_bytes", 0),
+                    "estimated_memory_bytes": kernel_info["metrics"].get(
+                        "estimated_memory_bytes", 0
+                    ),
                     # Thread dimension usage
-                    "uses_threadIdx_x": int(kernel_info["thread_usage"].get("uses_threadIdx_x", False)),
-                    "uses_threadIdx_y": int(kernel_info["thread_usage"].get("uses_threadIdx_y", False)),
-                    "uses_threadIdx_z": int(kernel_info["thread_usage"].get("uses_threadIdx_z", False)),
-                    "uses_blockIdx_x": int(kernel_info["thread_usage"].get("uses_blockIdx_x", False)),
-                    "uses_blockIdx_y": int(kernel_info["thread_usage"].get("uses_blockIdx_y", False)),
-                    "uses_blockIdx_z": int(kernel_info["thread_usage"].get("uses_blockIdx_z", False)),
-                    "uses_blockDim_x": int(kernel_info["thread_usage"].get("uses_blockDim_x", False)),
-                    "uses_blockDim_y": int(kernel_info["thread_usage"].get("uses_blockDim_y", False)),
-                    "uses_blockDim_z": int(kernel_info["thread_usage"].get("uses_blockDim_z", False)),
+                    "uses_threadIdx_x": int(
+                        kernel_info["thread_usage"].get("uses_threadIdx_x", False)
+                    ),
+                    "uses_threadIdx_y": int(
+                        kernel_info["thread_usage"].get("uses_threadIdx_y", False)
+                    ),
+                    "uses_threadIdx_z": int(
+                        kernel_info["thread_usage"].get("uses_threadIdx_z", False)
+                    ),
+                    "uses_blockIdx_x": int(
+                        kernel_info["thread_usage"].get("uses_blockIdx_x", False)
+                    ),
+                    "uses_blockIdx_y": int(
+                        kernel_info["thread_usage"].get("uses_blockIdx_y", False)
+                    ),
+                    "uses_blockIdx_z": int(
+                        kernel_info["thread_usage"].get("uses_blockIdx_z", False)
+                    ),
+                    "uses_blockDim_x": int(
+                        kernel_info["thread_usage"].get("uses_blockDim_x", False)
+                    ),
+                    "uses_blockDim_y": int(
+                        kernel_info["thread_usage"].get("uses_blockDim_y", False)
+                    ),
+                    "uses_blockDim_z": int(
+                        kernel_info["thread_usage"].get("uses_blockDim_z", False)
+                    ),
                 }
                 print(f"  ✓ {kernel_name}")
             else:
@@ -454,13 +479,15 @@ def add_kernel_features(
         "uses_blockDim_y",
         "uses_blockDim_z",
     ]
-    
+
     for feature in feature_columns:
         df[feature] = df["kernel"].map(
             lambda k: kernel_features.get(k, {}).get(feature, 0)
         )
 
-    print(f"\n✓ Added {len(feature_columns)} features for {len(kernel_features)} kernels")
+    print(
+        f"\n✓ Added {len(feature_columns)} features for {len(kernel_features)} kernels"
+    )
 
     return df
 
