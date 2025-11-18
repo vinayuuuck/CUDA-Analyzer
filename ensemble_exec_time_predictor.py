@@ -659,9 +659,6 @@ def get_candidate_problem_sizes(
     return [256, 512, 1024, 2048, 4096]
 
 
-# ------------------------------------------------
-# Updated analyze function (optional N)
-# ------------------------------------------------
 def analyze_cuda_file_and_predict(
     cuda_file,
     ensemble,

@@ -1,15 +1,19 @@
-#!/usr/bin/env python3
-"""
-CUDA Kernel Launch Configuration Optimizer
-Suggests optimal grid/block configurations using multiple ML approaches
-"""
 import sys
 import os
 from pathlib import Path
 import pickle
 import numpy as np
 import torch
+from typing import List, Tuple, Optional, Set
 from cuda_anal import CUDAKernelAnalyzer
+import warnings
+
+# Suppress sklearn feature name warnings and joblib parallel output
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
+os.environ['PYTHONWARNINGS'] = 'ignore::UserWarning'
+# Suppress joblib parallel backend messages
+import logging
+logging.getLogger('joblib').setLevel(logging.ERROR)
 
 
 class MultiModelSuggester:
@@ -217,20 +221,27 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
 
         return sorted(predictions, key=lambda x: x["predicted_time"])
 
-    def suggest(self, cuda_file, N):
+    def suggest(self, cuda_file, N=None):
         """
         Suggest optimal configurations using all available models
 
         Args:
             cuda_file: Path to .cu file
-            N: Problem size
+            N: Problem size (optional, defaults to 1024 for candidate generation)
 
         Returns:
             dict with results from all models
         """
+        # Use default value if N not provided
+        if N is None:
+            N = 1024
+            n_display = f"{N} (default)"
+        else:
+            n_display = str(N)
+        
         print(f"\n{'='*80}")
         print(f"ANALYZING: {cuda_file}")
-        print(f"Problem size: N={N}")
+        print(f"Problem size: N={n_display}")
         print(f"{'='*80}\n")
 
         # Analyze kernel
@@ -251,7 +262,6 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
             print(f"KERNEL: {kernel_name}")
             print(f"{'─'*80}")
 
-            # Extract features
             metrics = kernel_data["metrics"]
             memory = kernel_data["memory_access"]
             ops = kernel_data["operations"]
@@ -294,36 +304,16 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                 f"  Shared Memory: {'Yes' if kernel_info['has_shared_memory'] else 'No'}"
             )
 
-            # Generate candidates
-            dim = kernel_info["dimensionality"]
-            if dim == 1:
-                candidates = [
-                    (32, 1, 1),
-                    (64, 1, 1),
-                    (128, 1, 1),
-                    (256, 1, 1),
-                    (512, 1, 1),
-                    (1024, 1, 1),
-                ]
-            else:
-                candidates = [
-                    (8, 8, 1),
-                    (16, 8, 1),
-                    (16, 16, 1),
-                    (32, 8, 1),
-                    (32, 16, 1),
-                    (32, 32, 1),
-                    (64, 4, 1),
-                    (64, 8, 1),
-                    (64, 16, 1),
-                    (128, 4, 1),
-                    (128, 8, 1),
-                    (256, 4, 1),
-                ]
+            candidates_raw = self.generate_candidate_block_configs(
+                kernel_info, N=N, dimensionality=kernel_info["dimensionality"]
+            )
+            candidates = [(bx, by, bz) for (bx, by, bz) in candidates_raw]
+            kernel_result = {
+                "kernel": kernel_name,
+                "dimensionality": kernel_info["dimensionality"],
+                "models": {},
+            }
 
-            kernel_result = {"kernel": kernel_name, "dimensionality": dim, "models": {}}
-
-            # Predict with each available model
             if self.models_loaded["random_forest"]:
                 print(f"\n  Random Forest predictions:")
                 rf_preds = self._predict_random_forest(kernel_info, N, candidates)
@@ -363,6 +353,182 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
             results.append(kernel_result)
 
         return results
+
+    @staticmethod
+    def _powers_of_two_upto(max_val):
+        """Generate powers of 2 up to max_val"""
+        v = 1
+        out = []
+        while v <= max_val:
+            out.append(v)
+            v *= 2
+        return out
+
+    @staticmethod
+    def _divisors_of(n: int, max_val: int):
+        """Return reasonable divisors of n up to max_val (keeps only divisors >=8)."""
+        if n <= 0:
+            return []
+        divs = []
+        i = 1
+        while i * i <= n:
+            if n % i == 0:
+                if 8 <= i <= max_val:
+                    divs.append(i)
+                j = n // i
+                if 8 <= j <= max_val:
+                    divs.append(j)
+            i += 1
+        return sorted(set(divs))
+
+    @staticmethod
+    def generate_candidate_block_configs(
+        kernel_info: dict,
+        N: Optional[int] = None,
+        dimensionality: Optional[int] = None,
+        max_threads_per_block: int = 1024,
+        warp_size: int = 32,
+        prefer_more_threads_if_compute_bound: bool = True,
+        refine_topk: int = 6,
+    ) -> List[Tuple[int, int, int]]:
+        """
+        Generate a prioritized list of (block_x, block_y, block_z) candidates.
+        - kernel_info: dictionary with keys like compute_intensity, has_shared_memory
+        - N: optional problem size (int). If provided, include divisors of N as candidate tile sizes.
+        - dimensionality: if not provided, read from kernel_info['dimensionality'] (default 1)
+        """
+        if dimensionality is None:
+            dimensionality = int(kernel_info.get("dimensionality", 1))
+
+        compute_intensity = float(kernel_info.get("compute_intensity", 1.0))
+        has_shared = bool(kernel_info.get("has_shared_memory", False))
+
+        candidates: List[Tuple[int, int, int]] = []
+        seen: Set[Tuple[int, int, int]] = set()
+
+        # --- 1D kernels: block_x choices ---
+        if dimensionality == 1:
+            # Baseline warp-friendly sizes
+            base = [32, 64, 128, 256, 512, 1024]
+            base = [b for b in base if b <= max_threads_per_block]
+
+            # if N known, include divisors of N and neighbors
+            if N:
+                divs = MultiModelSuggester._divisors_of(N, max_threads_per_block)
+                base = sorted(set(base + divs))
+
+            # bias: if compute-heavy prefer larger block sizes (more threads), else smaller
+            if prefer_more_threads_if_compute_bound and compute_intensity >= 2.0:
+                base = sorted(base, reverse=True)
+            else:
+                base = sorted(base)
+
+            for b in base:
+                t = (b, 1, 1)
+                if t not in seen:
+                    candidates.append(t)
+                    seen.add(t)
+
+            return candidates
+
+        # --- 2D kernels: build tile-like candidates ---
+        # Good practice: include square tiles, rectangular tiles, and warp-aligned rows
+        small = [8, 16, 32, 64, 128]
+        # make sure we keep values <= max_threads_per_block
+        small = [x for x in small if x <= max_threads_per_block]
+        # generate combos
+        basic_tiles = [
+            (16, 16),
+            (32, 8),
+            (8, 32),
+            (32, 16),
+            (16, 32),
+            (32, 32),
+            (64, 4),
+            (64, 8),
+            (64, 16),
+            (128, 8),
+            (128, 4),
+            (256, 1),
+            (8, 8),
+        ]
+        # restrict to those with <= max_threads_per_block
+        basic_tiles = [t for t in basic_tiles if t[0] * t[1] <= max_threads_per_block]
+
+        # If N known, prefer divisors and tiles that divide N nicely (square tiling)
+        divisors = []
+        if N:
+            divisors = MultiModelSuggester._divisors_of(N, max_threads_per_block)
+
+        # helper to add candidate with warp friendliness (multiple of warp where possible)
+        def add2(bx, by):
+            if bx * by > max_threads_per_block or bx <= 0 or by <= 0:
+                return
+            # nudge to warp multiple: try making bx or by multiple of warp_size
+            for bx_try in {bx, ((bx + warp_size - 1) // warp_size) * warp_size}:
+                for by_try in {by, ((by + warp_size - 1) // warp_size) * warp_size}:
+                    if bx_try * by_try <= max_threads_per_block:
+                        t = (int(bx_try), int(by_try), 1)
+                        if t not in seen:
+                            candidates.append(t)
+                            seen.add(t)
+
+        # seed with basic tiles
+        for bx, by in basic_tiles:
+            add2(bx, by)
+
+        # include tiles from small * small grid
+        for bx in small:
+            for by in small:
+                if bx * by <= max_threads_per_block:
+                    add2(bx, by)
+
+        # include divisors-derived tiles: try (div,div), (div, 16), (16, div)
+        if divisors:
+            for d in divisors[:6]:
+                add2(d, d)
+                add2(d, 16)
+                add2(16, d)
+                add2(d, 8)
+                add2(8, d)
+
+        # bias selection by compute intensity and shared memory:
+        # - compute-bound: prefer larger total threads (sort descending)
+        # - memory-bound or shared-memory heavy: prefer smaller tiles with better locality (sort ascending)
+        if (
+            prefer_more_threads_if_compute_bound and compute_intensity >= 2.0
+        ) and not has_shared:
+            candidates = sorted(candidates, key=lambda t: -(t[0] * t[1]))
+        else:
+            candidates = sorted(candidates, key=lambda t: (t[0] * t[1]))
+
+        # --- local hierarchical refine: evaluate top-K neighborhood ---
+        # build neighbor multipliers
+        def neighbors(tile):
+            bx, by, _ = tile
+            neigh = []
+            for mx in (0.5, 1.0, 2.0):
+                for my in (0.5, 1.0, 2.0):
+                    nbx = int(max(1, round(bx * mx)))
+                    nby = int(max(1, round(by * my)))
+                    if nbx * nby <= max_threads_per_block:
+                        neigh.append((nbx, nby, 1))
+            return neigh
+
+        topk = candidates[:refine_topk]
+        for t in topk:
+            for n in neighbors(t):
+                if n not in seen:
+                    candidates.append(n)
+                    seen.add(n)
+
+        # final prune: keep unique, limited size, sorted by preference (preserve existing order)
+        final = []
+        for t in candidates:
+            if t not in final:
+                final.append(t)
+        # limit to ~60 candidates to bound runtime
+        return final[:60]
 
     def print_summary(self, results, N):
         """Print final summary with recommendations"""
@@ -428,15 +594,19 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
 
 
 def main():
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         print("CUDA Kernel Launch Configuration Optimizer")
         print("=" * 60)
-        print("\nUsage: python3 main.py <cuda_file.cu> <N>")
+        print("\nUsage: python3 main.py <cuda_file.cu> [N]")
         print("\nExamples:")
+        print("  python3 main.py vec_add.cu")
         print("  python3 main.py vec_add.cu 1048576")
         print(
             "  python3 main.py PolybenchCUDA/stencils/convolution-2d/2DConvolution.cu 2048"
         )
+        print("\nArguments:")
+        print("  cuda_file.cu  Path to CUDA kernel file")
+        print("  N             Problem size (optional, default: 1024)")
         print("\nThis tool uses multiple ML models to suggest optimal launch configs:")
         print("  • Random Forest (baseline)")
         print("  • Ensemble DNNs (best accuracy)")
@@ -445,14 +615,14 @@ def main():
         sys.exit(1)
 
     cuda_file = sys.argv[1]
-    N = int(sys.argv[2])
+    N = int(sys.argv[2]) if len(sys.argv) >= 3 else None
 
     try:
         suggester = MultiModelSuggester()
         results = suggester.suggest(cuda_file, N)
         suggester.print_summary(results, N)
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\nError: {e}")
         import traceback
 
         traceback.print_exc()

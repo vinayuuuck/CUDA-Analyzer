@@ -50,58 +50,58 @@ class KernelDataset(Dataset):
 def augment_data(X, y, kernel_ids, augmentation_factor=3, seed=42):
     """
     Generate synthetic samples via kernel-aware interpolation
-    
+
     Args:
         X: Feature matrix (N x D)
         y: Target values (log exec time)
         kernel_ids: Kernel IDs to ensure same-kernel mixing
         augmentation_factor: Number of synthetic samples per real sample
-        
+
     Returns:
         X_augmented, y_augmented, kernel_ids_augmented
     """
     np.random.seed(seed)
     X_aug_list, y_aug_list, kid_aug_list = [X], [y], [kernel_ids]
-    
+
     # Group by kernel
     unique_kernels = np.unique(kernel_ids)
-    
+
     for kernel_id in unique_kernels:
         mask = kernel_ids == kernel_id
         X_kernel = X[mask]
         y_kernel = y[mask]
-        
+
         if len(X_kernel) < 2:
             continue  # Need at least 2 samples to interpolate
-        
+
         n_samples = len(X_kernel)
         n_synthetic = min(n_samples * augmentation_factor, n_samples * 5)  # Cap at 5x
-        
+
         for _ in range(n_synthetic):
             # Pick two random samples from same kernel
             idx1, idx2 = np.random.choice(n_samples, 2, replace=False)
-            
+
             # Beta distribution favors balanced mixing (0.5)
             alpha = np.random.beta(2, 2)
-            
+
             # Interpolate features (some features should not be interpolated)
             X_new = alpha * X_kernel[idx1] + (1 - alpha) * X_kernel[idx2]
-            
+
             # For discrete features (uses_*, control_flow_ops, etc.), use majority vote
             # Assume first feature is kernel_encoded, keep it fixed
             X_new[0] = X_kernel[idx1, 0]
-            
+
             # Interpolate log(time) - more stable
             y_new = alpha * y_kernel[idx1] + (1 - alpha) * y_kernel[idx2]
-            
+
             X_aug_list.append(X_new.reshape(1, -1))
             y_aug_list.append([y_new])
             kid_aug_list.append([kernel_id])
-    
+
     X_augmented = np.vstack(X_aug_list)
     y_augmented = np.concatenate(y_aug_list)
     kernel_ids_augmented = np.concatenate(kid_aug_list)
-    
+
     return X_augmented, y_augmented, kernel_ids_augmented
 
 
@@ -169,7 +169,7 @@ class MultiTaskExecTimePredictor(nn.Module):
     Multi-task learning model with shared feature extractor
     and regime-specific prediction heads
     """
-    
+
     def __init__(
         self,
         input_dim,
@@ -179,60 +179,64 @@ class MultiTaskExecTimePredictor(nn.Module):
         dropout=0.15,
     ):
         super(MultiTaskExecTimePredictor, self).__init__()
-        
+
         # Shared feature extractor (learns from ALL data)
         shared_layers = []
         prev_dim = input_dim
-        
+
         for hidden_dim in shared_dims:
-            shared_layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ])
+            shared_layers.extend(
+                [
+                    nn.Linear(prev_dim, hidden_dim),
+                    nn.LayerNorm(hidden_dim),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                ]
+            )
             prev_dim = hidden_dim
-        
+
         self.shared_encoder = nn.Sequential(*shared_layers)
-        
+
         # Regime-specific prediction heads
         self.regime_heads = nn.ModuleList()
         for _ in range(num_regimes):
             head_layers = []
             head_prev_dim = prev_dim
-            
+
             for head_dim in head_dims:
-                head_layers.extend([
-                    nn.Linear(head_prev_dim, head_dim),
-                    nn.LayerNorm(head_dim),
-                    nn.GELU(),
-                    nn.Dropout(dropout / 2),
-                ])
+                head_layers.extend(
+                    [
+                        nn.Linear(head_prev_dim, head_dim),
+                        nn.LayerNorm(head_dim),
+                        nn.GELU(),
+                        nn.Dropout(dropout / 2),
+                    ]
+                )
                 head_prev_dim = head_dim
-            
+
             head_layers.append(nn.Linear(head_prev_dim, 1))
             self.regime_heads.append(nn.Sequential(*head_layers))
-        
+
         self._init_weights()
-    
+
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.LayerNorm):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-    
+
     def forward(self, x, regime_idx=None):
         # Shared encoding
         shared_features = self.shared_encoder(x)
-        
+
         # If regime specified, use that head
         if regime_idx is not None:
             return self.regime_heads[regime_idx](shared_features)
-        
+
         # Otherwise return all predictions (for multi-task training)
         return [head(shared_features) for head in self.regime_heads]
 
@@ -487,30 +491,34 @@ def pretrain_base_model(csv_file, output_dir, epochs=100):
     print("\n" + "=" * 70)
     print("PRE-TRAINING BASE MODEL ON ALL DATA")
     print("=" * 70)
-    
+
     # Load all data (no time filtering)
-    X, y, features, kernel_encoder, df = prepare_data(csv_file, time_min=None, time_max=None)
-    
+    X, y, features, kernel_encoder, df = prepare_data(
+        csv_file, time_min=None, time_max=None
+    )
+
     print(f"Pre-training on {len(X):,} samples")
-    
+
     # Split and scale
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.15, random_state=42)
-    
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=0.15, random_state=42
+    )
+
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_val_scaled = scaler.transform(X_val)
-    
+
     # Datasets
     train_dataset = KernelDataset(X_train_scaled, y_train)
     val_dataset = KernelDataset(X_val_scaled, y_val)
-    
+
     train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=256)
-    
+
     # Create base model (slightly smaller for generalization)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    
+
     base_model = LargeExecTimePredictor(
         input_dim=len(features),
         hidden_dims=[512, 256, 128, 64, 32],  # Shallower for pre-training
@@ -518,9 +526,9 @@ def pretrain_base_model(csv_file, output_dir, epochs=100):
         use_attention=True,
         num_residual_blocks=2,
     )
-    
+
     print(f"Base model parameters: {sum(p.numel() for p in base_model.parameters()):,}")
-    
+
     # Train
     trainer = AdvancedModelTrainer(base_model, device=device)
     best_loss = trainer.train(
@@ -532,24 +540,27 @@ def pretrain_base_model(csv_file, output_dir, epochs=100):
         warmup_epochs=5,
         gradient_accumulation_steps=1,
     )
-    
+
     # Save base model
     output_path = Path(output_dir) / "base_pretrained"
     output_path.mkdir(parents=True, exist_ok=True)
-    
+
     torch.save(base_model.state_dict(), output_path / "model.pth")
-    
+
     with open(output_path / "metadata.pkl", "wb") as f:
-        pickle.dump({
-            "scaler": scaler,
-            "features": features,
-            "kernel_encoder": kernel_encoder,
-            "best_loss": best_loss,
-        }, f)
-    
+        pickle.dump(
+            {
+                "scaler": scaler,
+                "features": features,
+                "kernel_encoder": kernel_encoder,
+                "best_loss": best_loss,
+            },
+            f,
+        )
+
     print(f"✓ Pre-trained base model saved to {output_path}/")
     print(f"Best validation loss: {best_loss:.6f}\n")
-    
+
     return base_model, scaler, features, kernel_encoder
 
 
@@ -741,12 +752,19 @@ def evaluate_model(model, test_loader, scaler, device="cpu"):
 
 
 def train_specialized_model(
-    csv_file, time_min, time_max, model_name, output_dir, epochs=300,
-    use_augmentation=True, pretrained_model=None, use_transfer_learning=True
+    csv_file,
+    time_min,
+    time_max,
+    model_name,
+    output_dir,
+    epochs=300,
+    use_augmentation=True,
+    pretrained_model=None,
+    use_transfer_learning=True,
 ):
     """
     Train a large-scale model for a specific time regime
-    
+
     Args:
         csv_file: Path to data CSV
         time_min, time_max: Time range for this regime
@@ -763,20 +781,24 @@ def train_specialized_model(
         f"Time range: {time_min if time_min else 0:.3f} - {time_max if time_max else 'inf'} ms"
     )
     print(f"Augmentation: {'ON' if use_augmentation else 'OFF'}")
-    print(f"Transfer Learning: {'ON' if use_transfer_learning and pretrained_model else 'OFF'}")
+    print(
+        f"Transfer Learning: {'ON' if use_transfer_learning and pretrained_model else 'OFF'}"
+    )
     print("=" * 70)
 
     X, y, features, kernel_encoder, df = prepare_data(csv_file, time_min, time_max)
-    kernel_ids = df['kernel_encoded'].values
-    
+    kernel_ids = df["kernel_encoded"].values
+
     original_size = len(X)
     print(f"Original samples: {original_size:,}")
-    
+
     # Data Augmentation for sparse regimes
     if use_augmentation and original_size < 2000:
         augmentation_factor = max(1, min(5, 2000 // original_size))
         print(f"Applying augmentation (factor={augmentation_factor})...")
-        X, y, kernel_ids = augment_data(X, y, kernel_ids, augmentation_factor=augmentation_factor)
+        X, y, kernel_ids = augment_data(
+            X, y, kernel_ids, augmentation_factor=augmentation_factor
+        )
         print(f"Augmented samples: {len(X):,} (+{len(X) - original_size:,})")
 
     # Split and scale
@@ -809,19 +831,24 @@ def train_specialized_model(
             use_attention=True,
             num_residual_blocks=3,
         )
-        
+
         # Load pre-trained weights (partial loading for matching layers)
         try:
             pretrained_dict = pretrained_model.state_dict()
             model_dict = model.state_dict()
-            
+
             # Filter out layers that don't match
-            pretrained_dict = {k: v for k, v in pretrained_dict.items() 
-                             if k in model_dict and v.shape == model_dict[k].shape}
-            
+            pretrained_dict = {
+                k: v
+                for k, v in pretrained_dict.items()
+                if k in model_dict and v.shape == model_dict[k].shape
+            }
+
             model_dict.update(pretrained_dict)
             model.load_state_dict(model_dict, strict=False)
-            print(f"Loaded {len(pretrained_dict)}/{len(model_dict)} layers from pre-trained model")
+            print(
+                f"Loaded {len(pretrained_dict)}/{len(model_dict)} layers from pre-trained model"
+            )
         except Exception as e:
             print(f"Warning: Could not load pre-trained weights: {e}")
     else:
@@ -837,7 +864,7 @@ def train_specialized_model(
 
     # Fine-tuning with lower learning rate if using transfer learning
     lr = 0.0001 if (use_transfer_learning and pretrained_model) else 0.0005
-    
+
     trainer = AdvancedModelTrainer(model, device=device)
     best_loss = trainer.train(
         train_loader,
@@ -881,6 +908,7 @@ def train_specialized_model(
 
     return metrics
 
+
 def main():
     import argparse
 
@@ -912,7 +940,7 @@ def main():
         print("  ✓ Transfer Learning (pre-train + fine-tune)")
         print("  ✓ Adaptive augmentation based on sample count")
         print("=" * 70)
-        
+
         # Step 1: Pre-train base model on all data
         print("\n[STEP 1/6] PRE-TRAINING BASE MODEL")
         base_model, base_scaler, base_features, base_encoder = pretrain_base_model(
@@ -1002,7 +1030,7 @@ def main():
         )
 
         print(f"\nModels saved to: {args.output_dir}/")
-    
+
     else:
         parser.print_help()
 
