@@ -1,19 +1,19 @@
 import sys
 import os
+import math
+import warnings
+import statistics
+from collections import defaultdict
 from pathlib import Path
 import pickle
 import numpy as np
 import torch
 from typing import List, Tuple, Optional, Set
 from cuda_anal import CUDAKernelAnalyzer
-import warnings
 
-# Suppress sklearn feature name warnings and joblib parallel output
-warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
-os.environ['PYTHONWARNINGS'] = 'ignore::UserWarning'
-# Suppress joblib parallel backend messages
-import logging
-logging.getLogger('joblib').setLevel(logging.ERROR)
+# Suppress warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
 
 
 class MultiModelSuggester:
@@ -27,29 +27,25 @@ class MultiModelSuggester:
     def __init__(self):
         self.models_loaded = {"random_forest": False, "ensemble": False, "llm": False}
 
-        # Try to load Random Forest
         try:
             self._load_random_forest()
         except Exception as e:
-            print(f"⚠ Random Forest not available: {e}")
+            print(f"Random Forest not available: {e}")
 
-        # Try to load Ensemble DNNs
         try:
             self._load_ensemble()
         except Exception as e:
-            print(f"⚠ Ensemble DNNs not available: {e}")
+            print(f"Ensemble DNNs not available: {e}")
 
-        # Try to load LLM
         try:
             self._load_llm()
         except Exception as e:
-            print(f"⚠ LLM not available: {e}")
+            print(f"LLM not available: {e}")
 
         if not any(self.models_loaded.values()):
             raise RuntimeError("No models available! Train at least one model first.")
 
     def _load_random_forest(self):
-        """Load Random Forest model"""
         model_path = "grid_block_model.pkl"
         features_path = "feature_names.pkl"
 
@@ -69,17 +65,15 @@ class MultiModelSuggester:
             self.rf_feature_names = pickle.load(f)
 
         self.models_loaded["random_forest"] = True
-        print("✓ Random Forest loaded")
+        print("Random Forest loaded")
 
     def _load_ensemble(self):
-        """Load Ensemble DNN models"""
         from ensemble_exec_time_predictor import EnsemblePredictor
 
         models_dir = "ensemble_models"
         if not os.path.exists(models_dir):
             return
 
-        # Check if at least one model exists
         has_models = any(
             (Path(models_dir) / model).exists() for model in ["fast", "medium", "slow"]
         )
@@ -88,10 +82,9 @@ class MultiModelSuggester:
 
         self.ensemble = EnsemblePredictor(models_dir)
         self.models_loaded["ensemble"] = True
-        print("✓ Ensemble DNNs loaded")
+        print("Ensemble DNNs loaded")
 
     def _load_llm(self):
-        """Load fine-tuned LLM"""
         import re
         from transformers import AutoTokenizer, AutoModelForCausalLM
 
@@ -106,10 +99,9 @@ class MultiModelSuggester:
         self.llm_model.eval()
 
         self.models_loaded["llm"] = True
-        print("✓ LLM loaded")
+        print("LLM loaded")
 
     def _predict_random_forest(self, kernel_info, N, candidates):
-        """Predict using Random Forest"""
         predictions = []
 
         for bx, by, bz in candidates:
@@ -151,12 +143,9 @@ class MultiModelSuggester:
         return sorted(predictions, key=lambda x: x["predicted_time"])
 
     def _predict_ensemble(self, kernel_info, N, candidates):
-        """Predict using Ensemble DNNs"""
-        # Add N to kernel_info
         kernel_info_with_n = kernel_info.copy()
         kernel_info_with_n["N"] = N
 
-        # Get predictions for all candidates
         _, _, _, all_preds = self.ensemble.predict_optimal_config(
             kernel_info_with_n, candidate_configs=[(bx, by) for bx, by, _ in candidates]
         )
@@ -164,7 +153,6 @@ class MultiModelSuggester:
         return all_preds
 
     def _predict_llm(self, kernel_info, N, candidates):
-        """Predict using fine-tuned LLM"""
         import re
 
         predictions = []
@@ -203,7 +191,6 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                 outputs[0], skip_special_tokens=True
             )
 
-            # Extract exec_time
             match = re.search(r"exec_time:\s*([\d.]+)\s*ms", generated_text)
             if match:
                 exec_time = float(match.group(1))
@@ -221,53 +208,118 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
 
         return sorted(predictions, key=lambda x: x["predicted_time"])
 
-    def suggest(self, cuda_file, N=None):
-        """
-        Suggest optimal configurations using all available models
+    def pick_best_across_Ns(self, per_N_results, strategy: str = "geom_mean"):
 
-        Args:
-            cuda_file: Path to .cu file
-            N: Problem size (optional, defaults to 1024 for candidate generation)
+        by_config = defaultdict(list)
+        for r in per_N_results:
+            t = r.get("predicted_time")
+            if t is None:
+                continue
+            key = (int(r["block_x"]), int(r["block_y"]), int(r.get("block_z", 1)))
+            by_config[key].append((int(r["N"]), float(t)))
 
-        Returns:
-            dict with results from all models
-        """
-        # Use default value if N not provided
-        if N is None:
-            N = 1024
-            n_display = f"{N} (default)"
+        stats = {}
+        for k, samples in by_config.items():
+            times = [t for (_, t) in samples]
+            if not times:
+                continue
+            mean_t = statistics.mean(times)
+            median_t = statistics.median(times)
+            safe_times = [max(1e-12, tt) for tt in times]
+            geom_mean_t = math.exp(
+                sum(math.log(tt) for tt in safe_times) / len(safe_times)
+            )
+            max_t = max(times)
+            stats[k] = {
+                "times": times,
+                "mean": mean_t,
+                "median": median_t,
+                "geom_mean": geom_mean_t,
+                "max": max_t,
+                "count_best": 0,
+                "num_samples": len(times),
+            }
+
+        # count per-N winners
+        times_by_N = defaultdict(list)
+        for (bx, by, bz), samples in by_config.items():
+            for N, t in samples:
+                times_by_N[N].append(((bx, by, bz), t))
+        for N, lst in times_by_N.items():
+            best_key = min(lst, key=lambda x: x[1])[0]
+            stats[best_key]["count_best"] = stats[best_key].get("count_best", 0) + 1
+
+        # scoring strategies
+        scores = {}
+        if strategy == "geom_mean":
+            for k, s in stats.items():
+                scores[k] = s["geom_mean"]
+        elif strategy == "median":
+            for k, s in stats.items():
+                scores[k] = s["median"]
+        elif strategy == "min_max":
+            for k, s in stats.items():
+                scores[k] = s["max"]
+        elif strategy == "mean":
+            for k, s in stats.items():
+                scores[k] = s["mean"]
+        elif strategy == "consensus":
+            max_count = max(s["count_best"] for s in stats.values())
+            candidates = [k for k, s in stats.items() if s["count_best"] == max_count]
+            best = min(candidates, key=lambda k: stats[k]["geom_mean"])
+            for k in stats:
+                scores[k] = 0 if k == best else 1
         else:
-            n_display = str(N)
-        
-        print(f"\n{'='*80}")
-        print(f"ANALYZING: {cuda_file}")
-        print(f"Problem size: N={n_display}")
-        print(f"{'='*80}\n")
+            for k, s in stats.items():
+                scores[k] = s["geom_mean"]
 
-        # Analyze kernel
+        if not scores:
+            raise ValueError("No candidate stats available to pick from")
+
+        best_key = min(scores.items(), key=lambda x: x[1])[0]
+        best_stats = stats[best_key].copy()
+        best_stats.update(
+            {
+                "block_x": best_key[0],
+                "block_y": best_key[1],
+                "block_z": best_key[2],
+                "score": scores[best_key],
+            }
+        )
+        return best_stats, stats
+
+    def evaluate_fixed_Ns_and_pick(
+        self,
+        cuda_file: str,
+        Ns=None,
+        strategy: str = "geom_mean",
+        topk_per_N: int = 1,
+        verbose: bool = True,
+    ):
+        if Ns is None:
+            Ns = [128, 256, 512, 1024, 2048, 4096]
+
         if not os.path.exists(cuda_file):
             raise FileNotFoundError(f"File not found: {cuda_file}")
 
         analyzer = CUDAKernelAnalyzer(cuda_file)
         kernels = analyzer.analyze()
-
         if not kernels:
             raise ValueError("No CUDA kernels found!")
 
-        results = []
+        all_kernel_results = []
 
         for kernel_data in kernels:
             kernel_name = kernel_data["name"]
-            print(f"\n{'─'*80}")
-            print(f"KERNEL: {kernel_name}")
-            print(f"{'─'*80}")
+            if verbose:
+                print(f"\n{'='*70}\nKernel: {kernel_name}\n{'='*70}")
 
             metrics = kernel_data["metrics"]
             memory = kernel_data["memory_access"]
             ops = kernel_data["operations"]
             thread_usage = kernel_data["thread_usage"]
 
-            kernel_info = {
+            kernel_info_base = {
                 "kernel_name": kernel_name,
                 "dimensionality": metrics.get(
                     "dimensionality", thread_usage.get("dimensionality", 1)
@@ -280,89 +332,201 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                 "global_writes": memory.get("global_writes", 5),
                 "arithmetic_ops": ops.get("arithmetic", 100),
                 "memory_ops": ops.get("memory", 15),
-                "control_flow_ops": ops.get("control_flow", 0),
-                "loop_ops": ops.get("loops", 0),
                 "uses_syncthreads": int(metrics.get("uses_syncthreads", False)),
-                "estimated_flops": metrics.get("estimated_flops", 0),
-                "estimated_memory_bytes": metrics.get("estimated_memory_bytes", 0),
-                "uses_threadIdx_x": int(thread_usage.get("uses_threadIdx_x", False)),
-                "uses_threadIdx_y": int(thread_usage.get("uses_threadIdx_y", False)),
-                "uses_threadIdx_z": int(thread_usage.get("uses_threadIdx_z", False)),
-                "uses_blockIdx_x": int(thread_usage.get("uses_blockIdx_x", False)),
-                "uses_blockIdx_y": int(thread_usage.get("uses_blockIdx_y", False)),
-                "uses_blockIdx_z": int(thread_usage.get("uses_blockIdx_z", False)),
-                "uses_blockDim_x": int(thread_usage.get("uses_blockDim_x", False)),
-                "uses_blockDim_y": int(thread_usage.get("uses_blockDim_y", False)),
-                "uses_blockDim_z": int(thread_usage.get("uses_blockDim_z", False)),
             }
 
-            print(f"  Dimensionality: {kernel_info['dimensionality']}D")
-            print(
-                f"  Compute Intensity: {kernel_info['compute_intensity']:.2f} FLOPs/byte"
-            )
-            print(
-                f"  Shared Memory: {'Yes' if kernel_info['has_shared_memory'] else 'No'}"
-            )
+            per_N_results = []
 
-            candidates_raw = self.generate_candidate_block_configs(
-                kernel_info, N=N, dimensionality=kernel_info["dimensionality"]
-            )
-            candidates = [(bx, by, bz) for (bx, by, bz) in candidates_raw]
-            kernel_result = {
-                "kernel": kernel_name,
-                "dimensionality": kernel_info["dimensionality"],
-                "models": {},
-            }
+            for N in Ns:
+                kernel_info = dict(kernel_info_base)
+                kernel_info["N"] = int(N)
 
-            if self.models_loaded["random_forest"]:
-                print(f"\n  Random Forest predictions:")
-                rf_preds = self._predict_random_forest(kernel_info, N, candidates)
-                best_rf = rf_preds[0]
-                print(
-                    f"    Best: ({best_rf['block_x']}, {best_rf['block_y']}, {best_rf['block_z']}) → {best_rf['predicted_time']:.6f}s"
+                candidates_raw = self.generate_candidate_block_configs(
+                    kernel_info, N=int(N), dimensionality=kernel_info["dimensionality"]
                 )
-                kernel_result["models"]["random_forest"] = {
-                    "best": best_rf,
-                    "all": rf_preds[:5],
-                }
+                candidates = [(bx, by, bz) for (bx, by, bz) in candidates_raw]
 
-            if self.models_loaded["ensemble"]:
-                print(f"\n  Ensemble DNN predictions:")
-                ens_preds = self._predict_ensemble(kernel_info, N, candidates)
-                best_ens = ens_preds[0]
-                print(
-                    f"    Best: ({best_ens['block_x']}, {best_ens['block_y']}, 1) → {best_ens['predicted_time']:.6f}s"
+                all_model_preds = {}
+
+                if self.models_loaded.get("ensemble"):
+                    all_model_preds["ensemble"] = self._predict_ensemble(
+                        kernel_info, int(N), candidates
+                    )
+
+                if self.models_loaded.get("random_forest"):
+                    all_model_preds["random_forest"] = self._predict_random_forest(
+                        kernel_info, int(N), candidates
+                    )
+
+                if self.models_loaded.get("llm"):
+                    all_model_preds["llm"] = self._predict_llm(
+                        kernel_info, int(N), candidates
+                    )
+
+                if not all_model_preds:
+                    raise RuntimeError("No models available to predict!")
+
+                if verbose:
+                    print(f"\n N={N:6d}")
+
+                    for model_name, preds in all_model_preds.items():
+                        if not preds:
+                            continue
+                        best = preds[0]
+                        model_label = {
+                            "ensemble": "Ensemble DNN",
+                            "random_forest": "Random Forest",
+                            "llm": "LLM",
+                        }.get(model_name, model_name)
+
+                        print(
+                            f"   {model_label:15} best: block=({best['block_x']},{best['block_y']},1)  pred={best['predicted_time']:.6f}"
+                        )
+                        for alt in preds[1:topk_per_N]:
+                            print(
+                                f"   {' '*15}  alt: block=({alt['block_x']},{alt['block_y']},1)  pred={alt['predicted_time']:.6f}"
+                            )
+
+                primary_model = (
+                    "ensemble"
+                    if "ensemble" in all_model_preds
+                    else list(all_model_preds.keys())[0]
                 )
-                kernel_result["models"]["ensemble"] = {
-                    "best": best_ens,
-                    "all": ens_preds[:5],
-                }
+                preds = all_model_preds[primary_model]
 
-            if self.models_loaded["llm"]:
-                print(f"\n  LLM predictions:")
-                llm_preds = self._predict_llm(kernel_info, N, candidates)
-                best_llm = llm_preds[0]
-                print(
-                    f"    Best: ({best_llm['block_x']}, {best_llm['block_y']}, {best_llm['block_z']}) → {best_llm['predicted_time']:.6f}s"
+                if not preds:
+                    continue
+
+                best = preds[0]
+                bx = int(best["block_x"])
+                by = int(best["block_y"])
+                bz = int(best.get("block_z", 1))
+
+                # compute grid dims for this N (use dimensionality info)
+                dim = kernel_info["dimensionality"]
+                # For 2D/3D we assume square domain if only single N provided (common convention).
+                if dim == 1:
+                    problem_shape = int(N)
+                elif dim == 2:
+                    problem_shape = (int(N), int(N))
+                else:  # 3D (best-effort)
+                    problem_shape = (int(N), int(N), 1)
+
+                grid_tuple = MultiModelSuggester.grid_from_block_and_problem(
+                    bx, by, problem_shape, dimensionality=dim
                 )
-                kernel_result["models"]["llm"] = {
-                    "best": best_llm,
-                    "all": llm_preds[:5],
+                grid_dims = f"({grid_tuple[0]}, {grid_tuple[1]}, {grid_tuple[2]})"
+
+                per_N_results.append(
+                    {
+                        "N": int(N),
+                        "block_x": bx,
+                        "block_y": by,
+                        "block_z": bz,
+                        "predicted_time": float(best["predicted_time"]),
+                        "all_preds": preds,
+                        "all_model_predictions": all_model_preds,
+                        "grid": grid_tuple,
+                        "grid_dims": grid_dims,
+                    }
+                )
+
+            if not per_N_results:
+                if verbose:
+                    print("  No per-N results for this kernel — skipping")
+                continue
+
+            chosen, stats = self.pick_best_across_Ns(per_N_results, strategy=strategy)
+
+            if verbose:
+                print("\n  Aggregated per-config stats (showing top 6 by geom_mean):")
+                sorted_stats = sorted(stats.items(), key=lambda kv: kv[1]["geom_mean"])
+                for (bx, by, bz), s in sorted_stats[:6]:
+                    print(
+                        f"    block=({bx},{by},{bz})  geom_mean={s['geom_mean']:.6f}  median={s['median']:.6f}  max={s['max']:.6f}  wins={s['count_best']}"
+                    )
+
+                print(
+                    f"\n  ✓ CHOSEN by '{strategy}': block=({chosen['block_x']},{chosen['block_y']},{chosen['block_z']})  score={chosen['score']:.6f}"
+                )
+                print("  Per-N bests:")
+                for r in per_N_results:
+                    print(
+                        f"    N={r['N']:6d}  best=({r['block_x']},{r['block_y']},{r.get('block_z',1)})  grid={r['grid_dims']}  pred={r['predicted_time']:.6f} ms"
+                    )
+
+            all_kernel_results.append(
+                {
+                    "kernel": kernel_name,
+                    "per_N_results": per_N_results,
+                    "chosen": chosen,
+                    "stats": stats,
                 }
+            )
 
-            results.append(kernel_result)
-
-        return results
+        return all_kernel_results
 
     @staticmethod
-    def _powers_of_two_upto(max_val):
-        """Generate powers of 2 up to max_val"""
-        v = 1
-        out = []
-        while v <= max_val:
-            out.append(v)
-            v *= 2
-        return out
+    def grid_from_block_and_problem(
+        block_x: int, block_y: int, problem_shape, dimensionality: int = 1
+    ):
+        """
+        Return (grid_x, grid_y, grid_z) that cover problem_shape with block dims.
+        problem_shape may be:
+          - int (interpreted as N for 1D or Nx=Ny=N for 2D)
+          - tuple/list of ints (Nx,) or (Nx,Ny) or (Nx,Ny,Nz)
+        """
+        # normalize problem_shape into tuple
+        if isinstance(problem_shape, (int, np.integer)):
+            if dimensionality == 1:
+                Nx = int(problem_shape)
+                gx = max(1, math.ceil(Nx / block_x))
+                return (gx, 1, 1)
+            elif dimensionality == 2:
+                Nx = int(problem_shape)
+                gx = max(1, math.ceil(Nx / block_x))
+                gy = max(1, math.ceil(Nx / block_y))
+                return (gx, gy, 1)
+            else:
+                Nx = int(problem_shape)
+                gx = max(1, math.ceil(Nx / block_x))
+                gy = max(1, math.ceil(Nx / block_y))
+                gz = 1
+                return (gx, gy, gz)
+        # tuple/list
+        try:
+            shape = tuple(int(x) for x in problem_shape)
+        except Exception:
+            # fallback to 1D N=1
+            return (1, 1, 1)
+
+        if dimensionality == 1:
+            Nx = shape[0]
+            gx = max(1, math.ceil(Nx / block_x))
+            return (gx, 1, 1)
+        elif dimensionality == 2:
+            if len(shape) >= 2:
+                Nx, Ny = shape[0], shape[1]
+            else:
+                Nx = Ny = shape[0]
+            gx = max(1, math.ceil(Nx / block_x))
+            gy = max(1, math.ceil(Ny / block_y))
+            return (gx, gy, 1)
+        elif dimensionality == 3:
+            if len(shape) >= 3:
+                Nx, Ny, Nz = shape[0], shape[1], shape[2]
+            elif len(shape) == 2:
+                Nx, Ny = shape
+                Nz = 1
+            else:
+                Nx = Ny = shape[0]
+                Nz = 1
+            gx = max(1, math.ceil(Nx / block_x))
+            gy = max(1, math.ceil(Ny / block_y))
+            gz = max(1, math.ceil(Nz / 1))
+            return (gx, gy, gz)
+        else:
+            return (1, 1, 1)
 
     @staticmethod
     def _divisors_of(n: int, max_val: int):
@@ -392,10 +556,9 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
         refine_topk: int = 6,
     ) -> List[Tuple[int, int, int]]:
         """
-        Generate a prioritized list of (block_x, block_y, block_z) candidates.
-        - kernel_info: dictionary with keys like compute_intensity, has_shared_memory
-        - N: optional problem size (int). If provided, include divisors of N as candidate tile sizes.
-        - dimensionality: if not provided, read from kernel_info['dimensionality'] (default 1)
+        Generate prioritized list of (block_x, block_y, block_z) candidates.
+        Supports 1D, 2D, and 3D kernels.
+        Keeps total threads <= max_threads_per_block.
         """
         if dimensionality is None:
             dimensionality = int(kernel_info.get("dimensionality", 1))
@@ -406,113 +569,112 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
         candidates: List[Tuple[int, int, int]] = []
         seen: Set[Tuple[int, int, int]] = set()
 
-        # --- 1D kernels: block_x choices ---
+        # helper to add candidate, nudging to warp-size multiples
+        def add_candidate(bx, by, bz=1):
+            if bx <= 0 or by <= 0 or bz <= 0:
+                return
+            if bx * by * bz > max_threads_per_block:
+                return
+            # try nudging bx/by/bz to warp multiples where sensible (only for bx or by)
+            bx_opts = {bx, ((bx + warp_size - 1) // warp_size) * warp_size}
+            by_opts = {by, ((by + warp_size - 1) // warp_size) * warp_size}
+            bz_opts = {bz}
+            for bx_try in bx_opts:
+                for by_try in by_opts:
+                    for bz_try in bz_opts:
+                        if bx_try * by_try * bz_try <= max_threads_per_block:
+                            t = (int(bx_try), int(by_try), int(bz_try))
+                            if t not in seen:
+                                candidates.append(t)
+                                seen.add(t)
+
+        # 1D kernels -> vary block_x; keep by=bz=1
         if dimensionality == 1:
-            # Baseline warp-friendly sizes
             base = [32, 64, 128, 256, 512, 1024]
             base = [b for b in base if b <= max_threads_per_block]
-
-            # if N known, include divisors of N and neighbors
             if N:
                 divs = MultiModelSuggester._divisors_of(N, max_threads_per_block)
                 base = sorted(set(base + divs))
-
-            # bias: if compute-heavy prefer larger block sizes (more threads), else smaller
             if prefer_more_threads_if_compute_bound and compute_intensity >= 2.0:
                 base = sorted(base, reverse=True)
             else:
                 base = sorted(base)
-
             for b in base:
-                t = (b, 1, 1)
-                if t not in seen:
-                    candidates.append(t)
-                    seen.add(t)
-
+                add_candidate(b, 1, 1)
             return candidates
 
-        # --- 2D kernels: build tile-like candidates ---
-        # Good practice: include square tiles, rectangular tiles, and warp-aligned rows
-        small = [8, 16, 32, 64, 128]
-        # make sure we keep values <= max_threads_per_block
+        # For 2D and 3D kernels we build base tiles and then extend with small z values for 3D
+        small = [4, 8, 16, 32, 64, 128]
         small = [x for x in small if x <= max_threads_per_block]
-        # generate combos
-        basic_tiles = [
+
+        basic_tiles_2d = [
+            (8, 8),
             (16, 16),
             (32, 8),
             (8, 32),
-            (32, 16),
             (16, 32),
+            (32, 16),
             (32, 32),
             (64, 4),
             (64, 8),
             (64, 16),
-            (128, 8),
             (128, 4),
+            (128, 8),
             (256, 1),
-            (8, 8),
         ]
-        # restrict to those with <= max_threads_per_block
-        basic_tiles = [t for t in basic_tiles if t[0] * t[1] <= max_threads_per_block]
+        basic_tiles_2d = [
+            t for t in basic_tiles_2d if t[0] * t[1] <= max_threads_per_block
+        ]
 
-        # If N known, prefer divisors and tiles that divide N nicely (square tiling)
+        # divisors for tiling if N present
         divisors = []
         if N:
             divisors = MultiModelSuggester._divisors_of(N, max_threads_per_block)
 
-        # helper to add candidate with warp friendliness (multiple of warp where possible)
-        def add2(bx, by):
-            if bx * by > max_threads_per_block or bx <= 0 or by <= 0:
-                return
-            # nudge to warp multiple: try making bx or by multiple of warp_size
-            for bx_try in {bx, ((bx + warp_size - 1) // warp_size) * warp_size}:
-                for by_try in {by, ((by + warp_size - 1) // warp_size) * warp_size}:
-                    if bx_try * by_try <= max_threads_per_block:
-                        t = (int(bx_try), int(by_try), 1)
-                        if t not in seen:
-                            candidates.append(t)
-                            seen.add(t)
+        # candidate z-values for 3D kernels (keep small to avoid exceeding per-block threads)
+        z_candidates = [1, 2, 4, 8] if dimensionality >= 3 else [1]
 
-        # seed with basic tiles
-        for bx, by in basic_tiles:
-            add2(bx, by)
+        # seed with basic 2D tiles and small*small grid
+        for bx, by in basic_tiles_2d:
+            for bz in z_candidates:
+                add_candidate(bx, by, bz)
 
-        # include tiles from small * small grid
         for bx in small:
             for by in small:
-                if bx * by <= max_threads_per_block:
-                    add2(bx, by)
+                for bz in z_candidates:
+                    if bx * by * bz <= max_threads_per_block:
+                        add_candidate(bx, by, bz)
 
-        # include divisors-derived tiles: try (div,div), (div, 16), (16, div)
+        # include divisor-derived tiles
         if divisors:
-            for d in divisors[:6]:
-                add2(d, d)
-                add2(d, 16)
-                add2(16, d)
-                add2(d, 8)
-                add2(8, d)
+            for d in divisors[:8]:
+                for bz in z_candidates:
+                    add_candidate(d, d, bz)
+                    add_candidate(d, 16, bz)
+                    add_candidate(16, d, bz)
+                    add_candidate(d, 8, bz)
+                    add_candidate(8, d, bz)
 
-        # bias selection by compute intensity and shared memory:
-        # - compute-bound: prefer larger total threads (sort descending)
-        # - memory-bound or shared-memory heavy: prefer smaller tiles with better locality (sort ascending)
+        # bias selection
         if (
             prefer_more_threads_if_compute_bound and compute_intensity >= 2.0
         ) and not has_shared:
-            candidates = sorted(candidates, key=lambda t: -(t[0] * t[1]))
+            candidates = sorted(candidates, key=lambda t: -(t[0] * t[1] * t[2]))
         else:
-            candidates = sorted(candidates, key=lambda t: (t[0] * t[1]))
+            candidates = sorted(candidates, key=lambda t: (t[0] * t[1] * t[2]))
 
-        # --- local hierarchical refine: evaluate top-K neighborhood ---
-        # build neighbor multipliers
+        # local neighborhood refine for top-K
         def neighbors(tile):
-            bx, by, _ = tile
+            bx, by, bz = tile
             neigh = []
             for mx in (0.5, 1.0, 2.0):
                 for my in (0.5, 1.0, 2.0):
-                    nbx = int(max(1, round(bx * mx)))
-                    nby = int(max(1, round(by * my)))
-                    if nbx * nby <= max_threads_per_block:
-                        neigh.append((nbx, nby, 1))
+                    for mz in (1.0, 2.0) if dimensionality >= 3 else (1.0,):
+                        nbx = int(max(1, round(bx * mx)))
+                        nby = int(max(1, round(by * my)))
+                        nbz = int(max(1, round(bz * mz)))
+                        if nbx * nby * nbz <= max_threads_per_block:
+                            neigh.append((nbx, nby, nbz))
             return neigh
 
         topk = candidates[:refine_topk]
@@ -522,92 +684,26 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                     candidates.append(n)
                     seen.add(n)
 
-        # final prune: keep unique, limited size, sorted by preference (preserve existing order)
+        # dedupe and limit
         final = []
         for t in candidates:
             if t not in final:
                 final.append(t)
-        # limit to ~60 candidates to bound runtime
-        return final[:60]
-
-    def print_summary(self, results, N):
-        """Print final summary with recommendations"""
-        print(f"\n{'='*80}")
-        print(f"RECOMMENDED LAUNCH CONFIGURATIONS (N={N})")
-        print(f"{'='*80}\n")
-
-        for result in results:
-            kernel_name = result["kernel"]
-            dim = result["dimensionality"]
-
-            print(f"{kernel_name}:")
-            print(f"  Dimensionality: {dim}D\n")
-
-            # Show recommendation from each model
-            for model_name, model_data in result["models"].items():
-                best = model_data["best"]
-                bx, by = best["block_x"], best["block_y"]
-                bz = best.get("block_z", 1)
-                time = best["predicted_time"]
-
-                # Compute grid
-                if dim == 1:
-                    grid = f"({(N + bx - 1) // bx}, 1, 1)"
-                else:
-                    grid = f"({(N + bx - 1) // bx}, {(N + by - 1) // by}, 1)"
-
-                model_label = {
-                    "random_forest": "Random Forest",
-                    "ensemble": "Ensemble DNN",
-                    "llm": "LLM",
-                }.get(model_name, model_name)
-
-                print(
-                    f"  {model_label:15} → <<<{grid}, ({bx}, {by}, {bz})>>> ({time:.6f}s)"
-                )
-
-            # Consensus recommendation
-            if len(result["models"]) > 1:
-                # Use ensemble if available, otherwise RF
-                if "ensemble" in result["models"]:
-                    best = result["models"]["ensemble"]["best"]
-                    model_used = "Ensemble DNN"
-                elif "random_forest" in result["models"]:
-                    best = result["models"]["random_forest"]["best"]
-                    model_used = "Random Forest"
-                else:
-                    best = result["models"]["llm"]["best"]
-                    model_used = "LLM"
-
-                bx, by = best["block_x"], best["block_y"]
-                bz = best.get("block_z", 1)
-
-                if dim == 1:
-                    grid = f"({(N + bx - 1) // bx}, 1, 1)"
-                else:
-                    grid = f"({(N + bx - 1) // bx}, {(N + by - 1) // by}, 1)"
-
-                print(f"\n  ⭐ RECOMMENDED (using {model_used}):")
-                print(f"     {kernel_name}<<<{grid}, ({bx}, {by}, {bz})>>>();")
-
-            print()
+        return final[:120]  # allow a few more candidates for 3D searches
 
 
 def main():
     if len(sys.argv) < 2:
         print("CUDA Kernel Launch Configuration Optimizer")
         print("=" * 60)
-        print("\nUsage: python3 main.py <cuda_file.cu> [N]")
+        print("\nUsage: python3 main.py <cuda_file.cu>")
         print("\nExamples:")
         print("  python3 main.py vec_add.cu")
-        print("  python3 main.py vec_add.cu 1048576")
         print(
-            "  python3 main.py PolybenchCUDA/stencils/convolution-2d/2DConvolution.cu 2048"
+            "  python3 main.py PolybenchCUDA/stencils/convolution-2d/2DConvolution.cu"
         )
-        print("\nArguments:")
-        print("  cuda_file.cu  Path to CUDA kernel file")
-        print("  N             Problem size (optional, default: 1024)")
-        print("\nThis tool uses multiple ML models to suggest optimal launch configs:")
+        print("\nThis tool evaluates kernels across multiple problem sizes")
+        print("and recommends the best configuration using:")
         print("  • Random Forest (baseline)")
         print("  • Ensemble DNNs (best accuracy)")
         print("  • Fine-tuned LLM (if available)")
@@ -615,12 +711,57 @@ def main():
         sys.exit(1)
 
     cuda_file = sys.argv[1]
-    N = int(sys.argv[2]) if len(sys.argv) >= 3 else None
 
     try:
         suggester = MultiModelSuggester()
-        results = suggester.suggest(cuda_file, N)
-        suggester.print_summary(results, N)
+        results = suggester.evaluate_fixed_Ns_and_pick(
+            cuda_file,
+            Ns=[128, 256, 512, 1024, 2048, 4096],
+            strategy="geom_mean",
+            topk_per_N=2,
+            verbose=True,
+        )
+
+        print(f"\n{'='*80}")
+        print("FINAL RECOMMENDATIONS")
+        print(f"{'='*80}\n")
+        for kernel_result in results:
+            chosen = kernel_result["chosen"]
+            print(f"Kernel: {kernel_result['kernel']}")
+            Ns_tested = (
+                [r["N"] for r in kernel_result["per_N_results"]]
+                if kernel_result["per_N_results"]
+                else []
+            )
+            if Ns_tested:
+                median_N = int(statistics.median(Ns_tested))
+                dim = kernel_result.get("dimensionality", 1)
+                if dim == 1:
+                    rep_shape = median_N
+                elif dim == 2:
+                    rep_shape = (median_N, median_N)
+                else:
+                    rep_shape = (median_N, median_N, 1)
+                rep_grid = MultiModelSuggester.grid_from_block_and_problem(
+                    int(chosen["block_x"]),
+                    int(chosen["block_y"]),
+                    rep_shape,
+                    dimensionality=dim,
+                )
+                rep_grid_str = f"({rep_grid[0]}, {rep_grid[1]}, {rep_grid[2]})"
+            else:
+                rep_grid_str = "(?, ?, ?)"
+
+            print(
+                f"  Best config: block=({chosen['block_x']},{chosen['block_y']},{chosen.get('block_z',1)})"
+            )
+            print(f"  Representative grid for median N: {rep_grid_str}")
+            print(f"  Geometric mean time: {chosen['geom_mean']:.6f}s")
+            print(
+                f"  Won {chosen['count_best']} out of {chosen['num_samples']} N values"
+            )
+            print()
+
     except Exception as e:
         print(f"\nError: {e}")
         import traceback

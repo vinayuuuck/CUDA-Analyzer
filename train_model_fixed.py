@@ -79,7 +79,7 @@ def train_model():
         min_samples_leaf=1,
         random_state=42,
         n_jobs=-1,
-        verbose=1,
+        verbose=0,
     )
 
     model.fit(X_train, y_train)
