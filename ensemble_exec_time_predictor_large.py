@@ -20,6 +20,8 @@ Advanced Training Techniques (NEW):
 import pandas as pd
 import numpy as np
 import pickle
+import math
+import argparse
 from pathlib import Path
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, LabelEncoder
@@ -29,7 +31,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
-import copy
 
 
 class KernelDataset(Dataset):
@@ -909,9 +910,223 @@ def train_specialized_model(
     return metrics
 
 
-def main():
-    import argparse
+class EnsemblePredictor:
+    """Smart ensemble predictor with 5-regime model routing"""
 
+    def __init__(self, models_dir):
+        self.models = {}
+        self.metadata = {}
+
+        for model_name in ["fast", "medium_fast", "medium", "medium_slow", "slow"]:
+            model_path = Path(models_dir) / model_name
+            if model_path.exists():
+                # Load metadata
+                with open(model_path / "metadata.pkl", "rb") as f:
+                    meta = pickle.load(f)
+
+                # Load model
+                model = LargeExecTimePredictor(
+                    input_dim=len(meta["features"]),
+                    **meta.get("model_config", {
+                        "hidden_dims": [512, 512, 256, 256, 128, 128, 64, 64, 32],
+                        "dropout": 0.15,
+                        "use_attention": True,
+                        "num_residual_blocks": 3,
+                    })
+                )
+                model.load_state_dict(
+                    torch.load(model_path / "model.pth", weights_only=True)
+                )
+                model.eval()
+
+                self.models[model_name] = model
+                self.metadata[model_name] = meta
+
+                print(
+                    f"✓ Loaded {model_name} model (R²={meta['metrics']['r2_real']:.3f})"
+                )
+
+    def estimate_regime(self, kernel_info):
+        """Estimate which time regime this kernel falls into (5 regimes)"""
+        # Simple heuristic based on problem size and complexity
+        N = kernel_info.get("N", 1024)
+        dim = kernel_info.get("dimensionality", 1)
+        compute = kernel_info.get("compute_intensity", 1.0)
+
+        # Rough estimate: time ~ N^dim * compute / 100000
+        estimated_time = (N**dim) * compute / 100000.0
+
+        if estimated_time < 0.5:
+            return "fast"
+        elif estimated_time < 5.0:
+            return "medium_fast"
+        elif estimated_time < 50.0:
+            return "medium"
+        elif estimated_time < 500.0:
+            return "medium_slow"
+        else:
+            return "slow"
+
+    def predict_single(self, model_name, kernel_info, block_x, block_y):
+        """Predict using a specific model"""
+        meta = self.metadata[model_name]
+        model = self.models[model_name]
+
+        # Prepare features (match training)
+        feature_values = []
+
+        # Create temp dataframe to use prepare_features
+        temp_df = pd.DataFrame(
+            [
+                {
+                    "N": kernel_info.get("N", 1024),
+                    "block_x": block_x,
+                    "block_y": block_y,
+                    "dimensionality": kernel_info.get("dimensionality", 1),
+                    "compute_intensity": kernel_info.get("compute_intensity", 1.0),
+                    "has_shared_memory": kernel_info.get("has_shared_memory", 0),
+                    "global_reads": kernel_info.get("global_reads", 10),
+                    "global_writes": kernel_info.get("global_writes", 5),
+                    "arithmetic_ops": kernel_info.get("arithmetic_ops", 100),
+                    "memory_ops": kernel_info.get("memory_ops", 15),
+                    "control_flow_ops": kernel_info.get("control_flow_ops", 0),
+                    "loop_ops": kernel_info.get("loop_ops", 0),
+                    "uses_syncthreads": kernel_info.get("uses_syncthreads", 0),
+                    "estimated_flops": kernel_info.get("estimated_flops", 0),
+                    "estimated_memory_bytes": kernel_info.get(
+                        "estimated_memory_bytes", 0
+                    ),
+                    "uses_threadIdx_x": kernel_info.get("uses_threadIdx_x", 0),
+                    "uses_threadIdx_y": kernel_info.get("uses_threadIdx_y", 0),
+                    "uses_threadIdx_z": kernel_info.get("uses_threadIdx_z", 0),
+                    "uses_blockIdx_x": kernel_info.get("uses_blockIdx_x", 0),
+                    "uses_blockIdx_y": kernel_info.get("uses_blockIdx_y", 0),
+                    "uses_blockIdx_z": kernel_info.get("uses_blockIdx_z", 0),
+                    "uses_blockDim_x": kernel_info.get("uses_blockDim_x", 0),
+                    "uses_blockDim_y": kernel_info.get("uses_blockDim_y", 0),
+                    "uses_blockDim_z": kernel_info.get("uses_blockDim_z", 0),
+                }
+            ]
+        )
+
+        temp_df = prepare_features(temp_df)
+
+        # Extract feature values in correct order
+        for feat in meta["features"]:
+            if feat == "kernel_encoded":
+                try:
+                    encoded = meta["kernel_encoder"].transform(
+                        [kernel_info["kernel_name"]]
+                    )[0]
+                except:
+                    encoded = 0
+                feature_values.append(encoded)
+            elif feat in temp_df.columns:
+                feature_values.append(temp_df[feat].iloc[0])
+            else:
+                feature_values.append(0)
+
+        X = np.array([feature_values])
+        X_scaled = meta["scaler"].transform(X)
+
+        # Predict
+        X_tensor = torch.FloatTensor(X_scaled)
+        with torch.no_grad():
+            pred_log = model(X_tensor).item()
+
+        return np.exp(pred_log)
+
+    def predict_optimal_config(self, kernel_info, candidate_configs=None):
+        """Find optimal config using appropriate model(s)"""
+        # Determine regime
+        regime = self.estimate_regime(kernel_info)
+
+        if regime not in self.models:
+            # Fallback to any available model
+            regime = list(self.models.keys())[0]
+            print(f"⚠ Using fallback model: {regime}")
+
+        # Generate candidates
+        if candidate_configs is None:
+            dim = kernel_info.get("dimensionality", 1)
+            if dim == 1:
+                candidate_configs = [
+                    (32, 1),
+                    (64, 1),
+                    (128, 1),
+                    (256, 1),
+                    (512, 1),
+                    (1024, 1),
+                ]
+            else:
+                candidate_configs = [
+                    (8, 8),
+                    (16, 8),
+                    (16, 16),
+                    (32, 8),
+                    (32, 16),
+                    (32, 32),
+                    (64, 4),
+                    (64, 8),
+                    (64, 16),
+                    (128, 4),
+                    (128, 8),
+                    (256, 4),
+                ]
+
+        # Predict for all configs
+        predictions = []
+        for block_x, block_y in candidate_configs:
+            pred_time = self.predict_single(regime, kernel_info, block_x, block_y)
+            predictions.append(
+                {"block_x": block_x, "block_y": block_y, "predicted_time": pred_time}
+            )
+
+        # Find best
+        best = min(predictions, key=lambda x: x["predicted_time"])
+
+        return best["block_x"], best["block_y"], best["predicted_time"], predictions
+
+
+def grid_from_block_and_problem(block_x, block_y, problem_shape, dimensionality=1):
+    """Return (grid_x, grid_y, grid_z) that cover problem_shape with block dims."""
+    if dimensionality == 1:
+        N = int(problem_shape)
+        gx = max(1, math.ceil(N / block_x))
+        return (gx, 1, 1)
+    elif dimensionality == 2:
+        Nx, Ny = problem_shape
+        gx = max(1, math.ceil(Nx / block_x))
+        gy = max(1, math.ceil(Ny / block_y))
+        return (gx, gy, 1)
+    elif dimensionality == 3:
+        Nx, Ny, Nz = problem_shape
+        gz = max(1, math.ceil(Nz / 1))
+        return (max(1, math.ceil(Nx / block_x)), max(1, math.ceil(Ny / block_y)), gz)
+    return (1, 1, 1)
+
+
+def grid_for_saturation(block_x, block_y, device_profile=None, target_blocks_per_sm=8):
+    """
+    Create a grid intended to saturate the device if problem size unknown.
+    device_profile example: {'sm_count': 80, 'max_grid_x': 2**31-1, 'max_grid_y': 65535}
+    """
+    if device_profile is None:
+        device_profile = {"sm_count": 80, "max_grid_x": 2**31 - 1, "max_grid_y": 65535}
+
+    sm = int(device_profile.get("sm_count", 80))
+    max_gx = int(device_profile.get("max_grid_x", 2**31 - 1))
+    max_gy = int(device_profile.get("max_grid_y", 65535))
+
+    target_blocks = sm * int(target_blocks_per_sm)
+    for gy in (1, 2, 4, 8):
+        gx = math.ceil(target_blocks / gy)
+        if gx <= max_gx and gy <= max_gy:
+            return (min(gx, max_gx), min(gy, max_gy), 1)
+    return (sm * target_blocks_per_sm, 1, 1)
+
+
+def main():
     parser = argparse.ArgumentParser(
         description="Large-Scale Ensemble Execution Time Predictor"
     )

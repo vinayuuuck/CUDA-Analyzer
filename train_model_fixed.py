@@ -8,19 +8,15 @@ import pickle
 
 
 def train_model():
-    # Load data
     df = pd.read_csv("klaraptor_enriched_data.csv")
     print(f"Loaded {len(df)} samples\n")
 
-    # CRITICAL FIX: Remove extreme outliers
     print("Cleaning data...")
     print(
         f"  Original range: {df['exec_time'].min():.6f}s - {df['exec_time'].max():.6f}s"
     )
 
-    # Remove times > 10 seconds (clearly errors or pathological cases)
     df_clean = df[df["exec_time"] <= 10.0].copy()
-    # Remove times < 0.000001 seconds (measurement noise)
     df_clean = df_clean[df_clean["exec_time"] >= 0.000001].copy()
 
     print(f"  Removed {len(df) - len(df_clean)} outliers")
@@ -29,7 +25,6 @@ def train_model():
     )
     print(f"  Final dataset: {len(df_clean)} samples\n")
 
-    # Prepare features and target
     feature_columns = [
         "N",
         "bx",

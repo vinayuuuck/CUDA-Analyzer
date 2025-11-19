@@ -68,14 +68,14 @@ class MultiModelSuggester:
         print("Random Forest loaded")
 
     def _load_ensemble(self):
-        from ensemble_exec_time_predictor import EnsemblePredictor
+        from ensemble_exec_time_predictor_large import EnsemblePredictor
 
-        models_dir = "ensemble_models"
+        models_dir = "ensemble_models_large"
         if not os.path.exists(models_dir):
             return
 
         has_models = any(
-            (Path(models_dir) / model).exists() for model in ["fast", "medium", "slow"]
+            (Path(models_dir) / model).exists() for model in ["fast", "medium_fast", "medium", "medium_slow", "slow"]
         )
         if not has_models:
             return
@@ -85,7 +85,6 @@ class MultiModelSuggester:
         print("Ensemble DNNs loaded")
 
     def _load_llm(self):
-        import re
         from transformers import AutoTokenizer, AutoModelForCausalLM
 
         llm_dir = "cuda_block_predictor_llm"
