@@ -927,12 +927,15 @@ class EnsemblePredictor:
                 # Load model
                 model = LargeExecTimePredictor(
                     input_dim=len(meta["features"]),
-                    **meta.get("model_config", {
-                        "hidden_dims": [512, 512, 256, 256, 128, 128, 64, 64, 32],
-                        "dropout": 0.15,
-                        "use_attention": True,
-                        "num_residual_blocks": 3,
-                    })
+                    **meta.get(
+                        "model_config",
+                        {
+                            "hidden_dims": [512, 512, 256, 256, 128, 128, 64, 64, 32],
+                            "dropout": 0.15,
+                            "use_attention": True,
+                            "num_residual_blocks": 3,
+                        },
+                    ),
                 )
                 model.load_state_dict(
                     torch.load(model_path / "model.pth", weights_only=True)

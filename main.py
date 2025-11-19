@@ -75,7 +75,8 @@ class MultiModelSuggester:
             return
 
         has_models = any(
-            (Path(models_dir) / model).exists() for model in ["fast", "medium_fast", "medium", "medium_slow", "slow"]
+            (Path(models_dir) / model).exists()
+            for model in ["fast", "medium_fast", "medium", "medium_slow", "slow"]
         )
         if not has_models:
             return
@@ -121,6 +122,20 @@ class MultiModelSuggester:
                         kernel_info["global_writes"],
                         kernel_info["arithmetic_ops"],
                         kernel_info["memory_ops"],
+                        kernel_info.get("control_flow_ops", 0),
+                        kernel_info.get("loop_ops", 0),
+                        kernel_info.get("uses_syncthreads", 0),
+                        kernel_info.get("estimated_flops", 0),
+                        kernel_info.get("estimated_memory_bytes", 0),
+                        kernel_info.get("uses_threadIdx_x", 0),
+                        kernel_info.get("uses_threadIdx_y", 0),
+                        kernel_info.get("uses_threadIdx_z", 0),
+                        kernel_info.get("uses_blockIdx_x", 0),
+                        kernel_info.get("uses_blockIdx_y", 0),
+                        kernel_info.get("uses_blockIdx_z", 0),
+                        kernel_info.get("uses_blockDim_x", 0),
+                        kernel_info.get("uses_blockDim_y", 0),
+                        kernel_info.get("uses_blockDim_z", 0),
                     ]
                 ]
             )
@@ -401,6 +416,18 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                 by = int(best["block_y"])
                 bz = int(best.get("block_z", 1))
 
+                # Store predictions from all available models
+                model_best_configs = {}
+                for model_name, model_preds in all_model_preds.items():
+                    if model_preds:
+                        model_best = model_preds[0]
+                        model_best_configs[model_name] = {
+                            "block_x": int(model_best["block_x"]),
+                            "block_y": int(model_best["block_y"]),
+                            "block_z": int(model_best.get("block_z", 1)),
+                            "predicted_time": float(model_best["predicted_time"])
+                        }
+
                 # compute grid dims for this N (use dimensionality info)
                 dim = kernel_info["dimensionality"]
                 # For 2D/3D we assume square domain if only single N provided (common convention).
@@ -425,6 +452,8 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                         "predicted_time": float(best["predicted_time"]),
                         "all_preds": preds,
                         "all_model_predictions": all_model_preds,
+                        "model_best_configs": model_best_configs,
+                        "primary_model": primary_model,
                         "grid": grid_tuple,
                         "grid_dims": grid_dims,
                     }
@@ -436,8 +465,49 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                 continue
 
             chosen, stats = self.pick_best_across_Ns(per_N_results, strategy=strategy)
+            
+            # Aggregate recommendations per model across all N values
+            model_recommendations = {}
+            for model_name in ["ensemble", "random_forest", "llm"]:
+                model_configs_per_n = []
+                for n_result in per_N_results:
+                    if model_name in n_result.get("model_best_configs", {}):
+                        config = n_result["model_best_configs"][model_name]
+                        model_configs_per_n.append({
+                            "N": n_result["N"],
+                            "block_x": config["block_x"],
+                            "block_y": config["block_y"],
+                            "block_z": config["block_z"],
+                            "predicted_time": config["predicted_time"],
+                        })
+                
+                if model_configs_per_n:
+                    # Pick best config for this model using the same strategy
+                    model_chosen, _ = self.pick_best_across_Ns(model_configs_per_n, strategy=strategy)
+                    model_recommendations[model_name] = model_chosen
 
             if verbose:
+                print("\n" + "="*70)
+                print("MODEL RECOMMENDATIONS")
+                print("="*70)
+                
+                # Determine primary model
+                primary = per_N_results[0].get("primary_model", "ensemble") if per_N_results else "ensemble"
+                
+                for model_name in ["ensemble", "random_forest", "llm"]:
+                    if model_name in model_recommendations:
+                        rec = model_recommendations[model_name]
+                        model_label = {
+                            "ensemble": "Ensemble DNN",
+                            "random_forest": "Random Forest",
+                            "llm": "LLM",
+                        }[model_name]
+                        
+                        is_primary = "✓ PREFERRED" if model_name == primary else "         "
+                        print(f"{is_primary} {model_label:15} → block=({rec['block_x']},{rec['block_y']},{rec['block_z']})  score={rec['score']:.6f}")
+                
+                print("="*70)
+                
                 print("\n  Aggregated per-config stats (showing top 6 by geom_mean):")
                 sorted_stats = sorted(stats.items(), key=lambda kv: kv[1]["geom_mean"])
                 for (bx, by, bz), s in sorted_stats[:6]:
@@ -460,6 +530,7 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                     "per_N_results": per_N_results,
                     "chosen": chosen,
                     "stats": stats,
+                    "model_recommendations": model_recommendations,
                 }
             )
 
@@ -631,7 +702,8 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
             divisors = MultiModelSuggester._divisors_of(N, max_threads_per_block)
 
         # candidate z-values for 3D kernels (keep small to avoid exceeding per-block threads)
-        z_candidates = [1, 2, 4, 8] if dimensionality >= 3 else [1]
+        # For 3D kernels, bias towards higher z values by listing them first
+        z_candidates = [8, 4, 2, 1] if dimensionality >= 3 else [1]
 
         # seed with basic 2D tiles and small*small grid
         for bx, by in basic_tiles_2d:
@@ -655,7 +727,10 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                     add_candidate(8, d, bz)
 
         # bias selection
-        if (
+        if dimensionality >= 3:
+            # For 3D kernels, prefer configs with higher block_z values
+            candidates = sorted(candidates, key=lambda t: (-t[2], t[0] * t[1] * t[2]))
+        elif (
             prefer_more_threads_if_compute_bound and compute_intensity >= 2.0
         ) and not has_shared:
             candidates = sorted(candidates, key=lambda t: -(t[0] * t[1] * t[2]))
@@ -720,46 +795,6 @@ def main():
             topk_per_N=2,
             verbose=True,
         )
-
-        print(f"\n{'='*80}")
-        print("FINAL RECOMMENDATIONS")
-        print(f"{'='*80}\n")
-        for kernel_result in results:
-            chosen = kernel_result["chosen"]
-            print(f"Kernel: {kernel_result['kernel']}")
-            Ns_tested = (
-                [r["N"] for r in kernel_result["per_N_results"]]
-                if kernel_result["per_N_results"]
-                else []
-            )
-            if Ns_tested:
-                median_N = int(statistics.median(Ns_tested))
-                dim = kernel_result.get("dimensionality", 1)
-                if dim == 1:
-                    rep_shape = median_N
-                elif dim == 2:
-                    rep_shape = (median_N, median_N)
-                else:
-                    rep_shape = (median_N, median_N, 1)
-                rep_grid = MultiModelSuggester.grid_from_block_and_problem(
-                    int(chosen["block_x"]),
-                    int(chosen["block_y"]),
-                    rep_shape,
-                    dimensionality=dim,
-                )
-                rep_grid_str = f"({rep_grid[0]}, {rep_grid[1]}, {rep_grid[2]})"
-            else:
-                rep_grid_str = "(?, ?, ?)"
-
-            print(
-                f"  Best config: block=({chosen['block_x']},{chosen['block_y']},{chosen.get('block_z',1)})"
-            )
-            print(f"  Representative grid for median N: {rep_grid_str}")
-            print(f"  Geometric mean time: {chosen['geom_mean']:.6f}s")
-            print(
-                f"  Won {chosen['count_best']} out of {chosen['num_samples']} N values"
-            )
-            print()
 
     except Exception as e:
         print(f"\nError: {e}")

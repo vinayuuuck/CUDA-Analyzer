@@ -38,6 +38,20 @@ def train_model():
         "global_writes",
         "arithmetic_ops",
         "memory_ops",
+        "control_flow_ops",
+        "loop_ops",
+        "uses_syncthreads",
+        "estimated_flops",
+        "estimated_memory_bytes",
+        "uses_threadIdx_x",
+        "uses_threadIdx_y",
+        "uses_threadIdx_z",
+        "uses_blockIdx_x",
+        "uses_blockIdx_y",
+        "uses_blockIdx_z",
+        "uses_blockDim_x",
+        "uses_blockDim_y",
+        "uses_blockDim_z",
     ]
 
     X = df_clean[feature_columns]
