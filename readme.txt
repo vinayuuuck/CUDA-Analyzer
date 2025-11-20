@@ -15,9 +15,15 @@ Machine learning models for predicting optimal CUDA thread block configurations 
 - **Clang/libclang**: Required for AST-based feature extraction
 
 ## Dependencies
-Install required packages (available on CIMS via pip):
+### For Training (Development Machine)
+Install full dependencies for training models:
 ```bash
-pip install --user torch scikit-learn pandas numpy libclang transformers
+pip install --user -r requirements_training.txt
+```
+
+Or manually:
+```bash
+pip install --user torch scikit-learn pandas numpy libclang transformers skl2onnx onnxruntime
 ```
 
 Specific versions used:
@@ -26,6 +32,21 @@ Specific versions used:
 - libclang 16.0+
 - transformers 4.30+ (for LLM model, optional)
 - pandas, numpy (standard versions)
+- skl2onnx 1.15+ (for ONNX export)
+- onnxruntime 1.12+ (for ONNX inference)
+
+### For Inference Only (Deployment Machine)
+**Minimal dependencies** for running predictions without PyTorch:
+```bash
+pip install --user -r requirements_inference.txt
+```
+
+This installs only:
+- onnxruntime (lightweight, ~50MB vs PyTorch ~2GB)
+- scikit-learn (for metadata handling)
+- numpy, pandas (standard libraries)
+
+**Note**: ONNX-based inference allows you to run predictions on machines without GPU or PyTorch!
 
 ## Project Structure
 ```
@@ -38,14 +59,24 @@ Specific versions used:
 ├── extract_klaraptor_data.py             # Data preprocessing from KLARAPTOR traces
 ├── klaraptor_enriched_data.csv           # Training dataset (12,687 clean samples)
 ├── grid_block_model.pkl                  # Pre-trained Random Forest model (R²=0.803)
+├── grid_block_model.onnx                 # ONNX version of Random Forest (for deployment)
 ├── feature_names.pkl                     # Feature metadata for Random Forest
 ├── ensemble_models_large/                # Pre-trained Ensemble DNN models (6 regimes)
-│   ├── base_pretrained/model.pth
-│   ├── fast/model.pth
-│   ├── medium_fast/model.pth
-│   ├── medium/model.pth
-│   ├── medium_slow/model.pth
-│   └── slow/model.pth
+│   ├── base_pretrained/
+│   │   ├── model.pth                     # PyTorch weights
+│   │   ├── model.onnx                    # ONNX version (for deployment)
+│   │   └── metadata.pkl
+│   ├── fast/
+│   │   ├── model.pth
+│   │   ├── model.onnx
+│   │   └── metadata.pkl
+│   ├── medium_fast/model.pth, model.onnx, metadata.pkl
+│   ├── medium/model.pth, model.onnx, metadata.pkl
+│   ├── medium_slow/model.pth, model.onnx, metadata.pkl
+│   └── slow/model.pth, model.onnx, metadata.pkl
+├── export_to_onnx.py                     # Export existing models to ONNX
+├── requirements_training.txt             # Full dependencies (training)
+├── requirements_inference.txt            # Minimal dependencies (inference only)
 ├── test-files/                           # Custom CUDA test kernels for validation
 │   ├── conv2D.cu
 │   ├── conv3D.cu
@@ -112,6 +143,82 @@ Grid dimensions will be calculated as: grid=(⌈N/32⌉, ⌈N/8⌉, 1)
 - Grid dimensions are computed automatically from problem size: grid_x = ⌈N/block_x⌉
 - No profiling required - predictions complete in <1 second
 - Models generalize to unseen kernels without retraining
+- By default, uses ONNX models (faster, minimal dependencies)
+- Use `--no-onnx` flag to force PyTorch inference (requires torch)
+
+## Deployment: ONNX Export for Lightweight Inference
+
+### Why ONNX?
+ONNX (Open Neural Network Exchange) allows you to:
+- **Run on machines without PyTorch** (PyTorch ~2GB vs ONNX Runtime ~50MB)
+- **Faster inference** (optimized C++ runtime)
+- **No GPU required** for inference
+- **Smaller deployment footprint**
+
+### Step 1: Export Models to ONNX (on development machine)
+
+After training your models, export them to ONNX format:
+
+```bash
+python3 export_to_onnx.py
+```
+
+This will:
+- Convert Random Forest to ONNX (grid_block_model.onnx)
+- Convert all 6 Ensemble DNN models to ONNX (model.onnx in each subdirectory)
+- Verify that all exported models can be loaded
+
+**Requirements for export**:
+```bash
+pip install --user skl2onnx onnx torch
+```
+
+### Step 2: Deploy to Inference Machine
+
+Copy these files to your deployment/inference machine:
+
+**Essential files**:
+- `main.py`, `cuda_anal.py`, `ensemble_dnn.py`
+- `grid_block_model.onnx` (Random Forest)
+- `grid_block_model.pkl`, `feature_names.pkl` (metadata)
+- `ensemble_models_large/*/model.onnx` (all 6 DNN models)
+- `ensemble_models_large/*/metadata.pkl` (all 6 metadata files)
+
+**Optional** (only if you want PyTorch fallback):
+- `*.pth` files (PyTorch weights)
+
+### Step 3: Install Minimal Dependencies (on inference machine)
+
+```bash
+pip install --user -r requirements_inference.txt
+```
+
+This installs only:
+- `onnxruntime` (~50MB)
+- `numpy`, `pandas`, `scikit-learn` (standard libraries)
+- **No PyTorch required!**
+
+### Step 4: Run Predictions
+
+```bash
+# Using ONNX (default, lightweight)
+python3 main.py your_kernel.cu
+
+# Force PyTorch (if you have it installed)
+python3 main.py your_kernel.cu --no-onnx
+```
+
+### Comparison: ONNX vs PyTorch
+
+| Aspect | ONNX Runtime | PyTorch |
+|--------|--------------|---------|
+| Installation size | ~50 MB | ~2 GB |
+| GPU required | No | Optional |
+| Inference speed | Fast (C++) | Moderate (Python) |
+| Dependencies | Minimal | Heavy |
+| Deployment | Easy | Complex |
+
+**Recommendation**: Use ONNX for deployment, PyTorch only for training.
 
 ## Benchmark Validation
 

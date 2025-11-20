@@ -1,12 +1,9 @@
-#!/usr/bin/env python3
 import os
 import sys
 import json
 import argparse
 from pathlib import Path
 
-# --- Configuration ---
-# Functions to ignore (Ghost Kernels)
 IGNORE_LIST = {
     "fopen",
     "fclose",
@@ -76,7 +73,6 @@ IGNORE_LIST = {
     "main",  # Added main just in case
 }
 
-# --- Imports ---
 try:
     from main import MultiModelSuggester
     from cuda_anal import CUDAKernelAnalyzer
@@ -89,7 +85,6 @@ except ImportError:
 def analyze_and_clean(cuda_dir, output_file):
     print(f" Starting Analysis on directory: {cuda_dir}")
 
-    # 1. Find Files
     cuda_files = []
     for root, dirs, files in os.walk(cuda_dir):
         for file in files:
@@ -102,7 +97,6 @@ def analyze_and_clean(cuda_dir, output_file):
 
     print(f"   Found {len(cuda_files)} CUDA files.")
 
-    # 2. Load Model
     try:
         suggester = MultiModelSuggester()
         print("✅ AI Model Loaded Successfully")
@@ -112,44 +106,35 @@ def analyze_and_clean(cuda_dir, output_file):
 
     results = {"kernels": {}}
 
-    # 3. Process Files
     valid_kernels_count = 0
 
     for i, cuda_file in enumerate(cuda_files, 1):
         print(f"   [{i}/{len(cuda_files)}] Analyzing {os.path.basename(cuda_file)}...")
 
         try:
-            # Analyze
             analyzer = CUDAKernelAnalyzer(cuda_file)
-            # This triggers the parser (which might find ghost kernels)
             found_kernels = analyzer.analyze()
 
             if not found_kernels:
                 print(f"      ⚠️ No kernels found.")
                 continue
 
-            # Predict
             kernel_results = suggester.evaluate_fixed_Ns_and_pick(
                 cuda_file, strategy="geom_mean", topk_per_N=1, verbose=False
             )
 
-            # Store & Clean on the fly
             for k_res in kernel_results:
                 k_name = k_res["kernel"]
 
-                # --- CLEANING FILTER ---
                 if k_name in IGNORE_LIST or k_name.startswith("__"):
                     print(f"      🧹 Ignoring ghost kernel: {k_name}")
                     continue
-                # -----------------------
 
-                # Save Valid Kernel
                 full_key = f"{os.path.basename(cuda_file)}::{k_name}"
 
                 chosen = k_res["chosen"]
                 model_recs = k_res.get("model_recommendations", {})
-                
-                # Get ensemble DNN recommendation (primary)
+
                 ensemble_config = None
                 if "ensemble" in model_recs:
                     ens = model_recs["ensemble"]
@@ -158,8 +143,7 @@ def analyze_and_clean(cuda_dir, output_file):
                         "block_y": int(ens["block_y"]),
                         "block_z": int(ens["block_z"]),
                     }
-                
-                # Get random forest recommendation
+
                 rf_config = None
                 if "random_forest" in model_recs:
                     rf = model_recs["random_forest"]
@@ -168,8 +152,7 @@ def analyze_and_clean(cuda_dir, output_file):
                         "block_y": int(rf["block_y"]),
                         "block_z": int(rf["block_z"]),
                     }
-                
-                # Store both configurations
+
                 results["kernels"][full_key] = {
                     "kernel_name": k_name,
                     "cuda_file": cuda_file,
@@ -181,19 +164,22 @@ def analyze_and_clean(cuda_dir, output_file):
                     "ensemble_config": ensemble_config,
                     "random_forest_config": rf_config,
                 }
-                
+
                 print(f"      ✅ Added {k_name}")
                 if ensemble_config:
-                    print(f"         Ensemble DNN: ({ensemble_config['block_x']}, {ensemble_config['block_y']}, {ensemble_config['block_z']})")
+                    print(
+                        f"         Ensemble DNN: ({ensemble_config['block_x']}, {ensemble_config['block_y']}, {ensemble_config['block_z']})"
+                    )
                 if rf_config:
-                    print(f"         Random Forest: ({rf_config['block_x']}, {rf_config['block_y']}, {rf_config['block_z']})")
-                
+                    print(
+                        f"         Random Forest: ({rf_config['block_x']}, {rf_config['block_y']}, {rf_config['block_z']})"
+                    )
+
                 valid_kernels_count += 1
 
         except Exception as e:
             print(f"      ❌ Error analyzing file: {e}")
 
-    # 4. Save Output
     with open(output_file, "w") as f:
         json.dump(results, f, indent=2)
 

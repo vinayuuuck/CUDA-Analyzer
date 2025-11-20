@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
@@ -55,7 +54,6 @@ def train_model():
     ]
 
     X = df_clean[feature_columns]
-    # Log transform the target for better scale handling
     y = np.log1p(df_clean["exec_time"])  # log(1 + exec_time)
 
     print(f"Features ({len(feature_columns)}):")
@@ -68,7 +66,6 @@ def train_model():
     print(f"  Mean:   {y.mean():.4f}")
     print(f"  Median: {y.median():.4f}\n")
 
-    # Split data
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
@@ -76,7 +73,6 @@ def train_model():
     print(f"Training samples: {len(X_train)}")
     print(f"Test samples:     {len(X_test)}\n")
 
-    # Train Random Forest
     print("=" * 70)
     print("Training Random Forest (log-transformed target)...")
     print("=" * 70)
@@ -94,7 +90,6 @@ def train_model():
     model.fit(X_train, y_train)
     print("\n✓ Training complete!\n")
 
-    # Evaluate
     y_pred_train = model.predict(X_train)
     y_pred_test = model.predict(X_test)
 
@@ -103,7 +98,6 @@ def train_model():
     train_r2 = r2_score(y_train, y_pred_train)
     test_r2 = r2_score(y_test, y_pred_test)
 
-    # Also calculate R² on original scale
     y_train_orig = np.expm1(y_train)  # Convert back from log
     y_test_orig = np.expm1(y_test)
     y_pred_train_orig = np.expm1(y_pred_train)
@@ -126,7 +120,6 @@ def train_model():
     print(f"Test R²:         {test_r2_orig:.4f}")
     print("=" * 70)
 
-    # Feature importance
     print("\nTop 10 Most Important Features:")
     print("-" * 70)
     importances = pd.DataFrame(
@@ -138,29 +131,32 @@ def train_model():
         bar = "█" * bar_length
         print(f"  {row['feature']:20s} {row['importance']:6.4f}  {bar}")
 
-    # Save model
     model_file = "grid_block_model.pkl"
     with open(model_file, "wb") as f:
         pickle.dump({"model": model, "log_transform": True}, f)
 
-    print(f"\n✓ Model saved to: {model_file}")
+    print(f"\nModel saved to: {model_file}")
 
     with open("feature_names.pkl", "wb") as f:
         pickle.dump(feature_columns, f)
 
-    print(f"✓ Feature names saved to: feature_names.pkl\n")
+    print(f"Feature names saved to: feature_names.pkl")
 
-    # Performance assessment
-    print("=" * 70)
-    if test_r2 > 0.85:
-        print("🎉 EXCELLENT! R² > 0.85 - Model is highly accurate!")
-    elif test_r2 > 0.75:
-        print("👍 GOOD! R² > 0.75 - Model performance is acceptable")
-    elif test_r2 > 0.65:
-        print("⚠️  FAIR. R² > 0.65 - Model could be improved")
-    else:
-        print("❌ POOR. R² < 0.65 - Model needs significant improvement")
-    print("=" * 70)
+    try:
+        from skl2onnx import convert_sklearn
+        from skl2onnx.common.data_types import FloatTensorType
+
+        initial_type = [("float_input", FloatTensorType([None, len(feature_columns)]))]
+        onnx_model = convert_sklearn(model, initial_types=initial_type)
+
+        onnx_file = "grid_block_model.onnx"
+        with open(onnx_file, "wb") as f:
+            f.write(onnx_model.SerializeToString())
+
+        print(f"ONNX model saved to: {onnx_file}\n")
+    except ImportError:
+        print("Warning: skl2onnx not installed. Install with: pip install skl2onnx")
+        print("ONNX export skipped.\n")
 
     return model, test_r2
 

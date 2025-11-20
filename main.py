@@ -1,19 +1,13 @@
 import sys
 import os
 import math
-import warnings
 import statistics
 from collections import defaultdict
 from pathlib import Path
 import pickle
 import numpy as np
-import torch
 from typing import List, Tuple, Optional, Set
 from cuda_anal import CUDAKernelAnalyzer
-
-# Suppress warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
-os.environ["PYTHONWARNINGS"] = "ignore::UserWarning"
 
 
 class MultiModelSuggester:
@@ -24,9 +18,10 @@ class MultiModelSuggester:
     3. Fine-tuned LLM (if available and explicitly requested)
     """
 
-    def __init__(self, use_llm=False):
+    def __init__(self, use_llm=False, use_onnx=True):
         self.models_loaded = {"random_forest": False, "ensemble": False, "llm": False}
         self.use_llm = use_llm
+        self.use_onnx = use_onnx
 
         try:
             self._load_random_forest()
@@ -48,47 +43,87 @@ class MultiModelSuggester:
             raise RuntimeError("No models available! Train at least one model first.")
 
     def _load_random_forest(self):
-        model_path = "grid_block_model.pkl"
         features_path = "feature_names.pkl"
 
-        if not os.path.exists(model_path):
-            return
+        if self.use_onnx:
+            onnx_path = "grid_block_model.onnx"
 
-        with open(model_path, "rb") as f:
-            model_data = pickle.load(f)
-            if isinstance(model_data, dict):
-                self.rf_model = model_data["model"]
-                self.rf_log_transform = model_data.get("log_transform", False)
-            else:
-                self.rf_model = model_data
-                self.rf_log_transform = False
+            if not os.path.exists(onnx_path) or not os.path.exists(features_path):
+                return
 
-        with open(features_path, "rb") as f:
-            self.rf_feature_names = pickle.load(f)
+            import onnxruntime as ort
 
-        self.models_loaded["random_forest"] = True
-        print("Random Forest loaded")
+            self.rf_model = ort.InferenceSession(
+                onnx_path, providers=["CPUExecutionProvider"]
+            )
+            self.rf_log_transform = True
+
+            with open(features_path, "rb") as f:
+                self.rf_feature_names = pickle.load(f)
+
+            self.models_loaded["random_forest"] = True
+            print("Random Forest loaded (ONNX)")
+        else:
+            model_path = "grid_block_model.pkl"
+
+            if not os.path.exists(model_path):
+                return
+
+            with open(model_path, "rb") as f:
+                model_data = pickle.load(f)
+                if isinstance(model_data, dict):
+                    self.rf_model = model_data["model"]
+                    self.rf_log_transform = model_data.get("log_transform", False)
+                else:
+                    self.rf_model = model_data
+                    self.rf_log_transform = False
+
+            with open(features_path, "rb") as f:
+                self.rf_feature_names = pickle.load(f)
+
+            self.models_loaded["random_forest"] = True
+            print("Random Forest loaded")
 
     def _load_ensemble(self):
-        from ensemble_dnn import EnsemblePredictor
+        if self.use_onnx:
+            # Use ONNX-only module (no torch dependency)
+            from ensemble_predictor_onnx import EnsemblePredictor
+        else:
+            # Use full module with PyTorch support
+            from ensemble_dnn import EnsemblePredictor
 
         models_dir = "ensemble_models_large"
         if not os.path.exists(models_dir):
             return
 
-        has_models = any(
-            (Path(models_dir) / model).exists()
-            for model in ["fast", "medium_fast", "medium", "medium_slow", "slow"]
-        )
+        if self.use_onnx:
+            has_models = any(
+                (Path(models_dir) / model / "model.onnx").exists()
+                for model in ["fast", "medium_fast", "medium", "medium_slow", "slow"]
+            )
+            self.ensemble = EnsemblePredictor(models_dir)
+        else:
+            has_models = any(
+                (Path(models_dir) / model).exists()
+                for model in ["fast", "medium_fast", "medium", "medium_slow", "slow"]
+            )
+            self.ensemble = EnsemblePredictor(models_dir, use_onnx=False)
+
         if not has_models:
             return
 
-        self.ensemble = EnsemblePredictor(models_dir)
         self.models_loaded["ensemble"] = True
         print("Ensemble DNNs loaded")
 
     def _load_llm(self):
-        from transformers import AutoTokenizer, AutoModelForCausalLM
+        try:
+            import torch
+            from transformers import AutoTokenizer, AutoModelForCausalLM
+
+            self.torch = torch
+        except ImportError as e:
+            print(f"LLM requires PyTorch and transformers: {e}")
+            return
 
         llm_dir = "cuda_block_predictor_llm"
         if not os.path.exists(llm_dir):
@@ -96,7 +131,7 @@ class MultiModelSuggester:
 
         self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_dir)
         self.llm_model = AutoModelForCausalLM.from_pretrained(
-            llm_dir, device_map="auto" if torch.cuda.is_available() else None
+            llm_dir, device_map="auto" if self.torch.cuda.is_available() else None
         )
         self.llm_model.eval()
 
@@ -142,7 +177,14 @@ class MultiModelSuggester:
                 ]
             )
 
-            pred_log_time = self.rf_model.predict(features)[0]
+            if self.use_onnx:
+                input_name = self.rf_model.get_inputs()[0].name
+                pred_log_time = self.rf_model.run(
+                    None, {input_name: features.astype(np.float32)}
+                )[0].item()
+            else:
+                pred_log_time = self.rf_model.predict(features)[0]
+
             pred_time = (
                 np.expm1(pred_log_time) if self.rf_log_transform else pred_log_time
             )
@@ -152,7 +194,7 @@ class MultiModelSuggester:
                     "block_x": bx,
                     "block_y": by,
                     "block_z": bz,
-                    "predicted_time": pred_time,
+                    "predicted_time": float(pred_time),
                 }
             )
 
@@ -187,14 +229,13 @@ arithmetic_ops: {kernel_info['arithmetic_ops']}
 memory_ops: {kernel_info['memory_ops']}
 Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
 
-### Predicted Execution Time:
 """
 
             inputs = self.llm_tokenizer(prompt, return_tensors="pt")
             device = next(self.llm_model.parameters()).device
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
-            with torch.no_grad():
+            with self.torch.no_grad():
                 outputs = self.llm_model.generate(
                     **inputs,
                     max_new_tokens=50,
@@ -256,7 +297,6 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                 "num_samples": len(times),
             }
 
-        # count per-N winners
         times_by_N = defaultdict(list)
         for (bx, by, bz), samples in by_config.items():
             for N, t in samples:
@@ -265,7 +305,6 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
             best_key = min(lst, key=lambda x: x[1])[0]
             stats[best_key]["count_best"] = stats[best_key].get("count_best", 0) + 1
 
-        # scoring strategies
         scores = {}
         if strategy == "geom_mean":
             for k, s in stats.items():
@@ -395,12 +434,22 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                             "llm": "LLM",
                         }.get(model_name, model_name)
 
+                        pred_time = (
+                            float(best["predicted_time"])
+                            if isinstance(best["predicted_time"], np.ndarray)
+                            else best["predicted_time"]
+                        )
                         print(
-                            f"   {model_label:15} best: block=({best['block_x']},{best['block_y']},1)  pred={best['predicted_time']:.6f}"
+                            f"   {model_label:15} best: block=({best['block_x']},{best['block_y']},1)  pred={pred_time:.6f}"
                         )
                         for alt in preds[1:topk_per_N]:
+                            alt_time = (
+                                float(alt["predicted_time"])
+                                if isinstance(alt["predicted_time"], np.ndarray)
+                                else alt["predicted_time"]
+                            )
                             print(
-                                f"   {' '*15}  alt: block=({alt['block_x']},{alt['block_y']},1)  pred={alt['predicted_time']:.6f}"
+                                f"   {' '*15}  alt: block=({alt['block_x']},{alt['block_y']},1)  pred={alt_time:.6f}"
                             )
 
                 primary_model = (
@@ -418,7 +467,6 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                 by = int(best["block_y"])
                 bz = int(best.get("block_z", 1))
 
-                # Store predictions from all available models
                 model_best_configs = {}
                 for model_name, model_preds in all_model_preds.items():
                     if model_preds:
@@ -427,12 +475,10 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                             "block_x": int(model_best["block_x"]),
                             "block_y": int(model_best["block_y"]),
                             "block_z": int(model_best.get("block_z", 1)),
-                            "predicted_time": float(model_best["predicted_time"])
+                            "predicted_time": float(model_best["predicted_time"]),
                         }
 
-                # compute grid dims for this N (use dimensionality info)
                 dim = kernel_info["dimensionality"]
-                # For 2D/3D we assume square domain if only single N provided (common convention).
                 if dim == 1:
                     problem_shape = int(N)
                 elif dim == 2:
@@ -467,35 +513,40 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                 continue
 
             chosen, stats = self.pick_best_across_Ns(per_N_results, strategy=strategy)
-            
-            # Aggregate recommendations per model across all N values
+
             model_recommendations = {}
             for model_name in ["ensemble", "random_forest", "llm"]:
                 model_configs_per_n = []
                 for n_result in per_N_results:
                     if model_name in n_result.get("model_best_configs", {}):
                         config = n_result["model_best_configs"][model_name]
-                        model_configs_per_n.append({
-                            "N": n_result["N"],
-                            "block_x": config["block_x"],
-                            "block_y": config["block_y"],
-                            "block_z": config["block_z"],
-                            "predicted_time": config["predicted_time"],
-                        })
-                
+                        model_configs_per_n.append(
+                            {
+                                "N": n_result["N"],
+                                "block_x": config["block_x"],
+                                "block_y": config["block_y"],
+                                "block_z": config["block_z"],
+                                "predicted_time": config["predicted_time"],
+                            }
+                        )
+
                 if model_configs_per_n:
-                    # Pick best config for this model using the same strategy
-                    model_chosen, _ = self.pick_best_across_Ns(model_configs_per_n, strategy=strategy)
+                    model_chosen, _ = self.pick_best_across_Ns(
+                        model_configs_per_n, strategy=strategy
+                    )
                     model_recommendations[model_name] = model_chosen
 
             if verbose:
-                print("\n" + "="*70)
+                print("\n" + "=" * 70)
                 print("MODEL RECOMMENDATIONS")
-                print("="*70)
-                
-                # Determine primary model
-                primary = per_N_results[0].get("primary_model", "ensemble") if per_N_results else "ensemble"
-                
+                print("=" * 70)
+
+                primary = (
+                    per_N_results[0].get("primary_model", "ensemble")
+                    if per_N_results
+                    else "ensemble"
+                )
+
                 for model_name in ["ensemble", "random_forest", "llm"]:
                     if model_name in model_recommendations:
                         rec = model_recommendations[model_name]
@@ -504,12 +555,16 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                             "random_forest": "Random Forest",
                             "llm": "LLM",
                         }[model_name]
-                        
-                        is_primary = "✓ PREFERRED" if model_name == primary else "         "
-                        print(f"{is_primary} {model_label:15} → block=({rec['block_x']},{rec['block_y']},{rec['block_z']})  score={rec['score']:.6f}")
-                
-                print("="*70)
-                
+
+                        is_primary = (
+                            "✓ PREFERRED" if model_name == primary else "         "
+                        )
+                        print(
+                            f"{is_primary} {model_label:15} → block=({rec['block_x']},{rec['block_y']},{rec['block_z']})  score={rec['score']:.6f}"
+                        )
+
+                print("=" * 70)
+
                 print("\n  Aggregated per-config stats (showing top 6 by geom_mean):")
                 sorted_stats = sorted(stats.items(), key=lambda kv: kv[1]["geom_mean"])
                 for (bx, by, bz), s in sorted_stats[:6]:
@@ -522,8 +577,13 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                 )
                 print("  Per-N bests:")
                 for r in per_N_results:
+                    pred_time = (
+                        float(r["predicted_time"])
+                        if isinstance(r["predicted_time"], np.ndarray)
+                        else r["predicted_time"]
+                    )
                     print(
-                        f"    N={r['N']:6d}  best=({r['block_x']},{r['block_y']},{r.get('block_z',1)})  grid={r['grid_dims']}  pred={r['predicted_time']:.6f} ms"
+                        f"    N={r['N']:6d}  best=({r['block_x']},{r['block_y']},{r.get('block_z',1)})  grid={r['grid_dims']}  pred={pred_time:.6f} ms"
                     )
 
             all_kernel_results.append(
@@ -548,7 +608,6 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
           - int (interpreted as N for 1D or Nx=Ny=N for 2D)
           - tuple/list of ints (Nx,) or (Nx,Ny) or (Nx,Ny,Nz)
         """
-        # normalize problem_shape into tuple
         if isinstance(problem_shape, (int, np.integer)):
             if dimensionality == 1:
                 Nx = int(problem_shape)
@@ -565,11 +624,9 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                 gy = max(1, math.ceil(Nx / block_y))
                 gz = 1
                 return (gx, gy, gz)
-        # tuple/list
         try:
             shape = tuple(int(x) for x in problem_shape)
         except Exception:
-            # fallback to 1D N=1
             return (1, 1, 1)
 
         if dimensionality == 1:
@@ -641,13 +698,11 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
         candidates: List[Tuple[int, int, int]] = []
         seen: Set[Tuple[int, int, int]] = set()
 
-        # helper to add candidate, nudging to warp-size multiples
         def add_candidate(bx, by, bz=1):
             if bx <= 0 or by <= 0 or bz <= 0:
                 return
             if bx * by * bz > max_threads_per_block:
                 return
-            # try nudging bx/by/bz to warp multiples where sensible (only for bx or by)
             bx_opts = {bx, ((bx + warp_size - 1) // warp_size) * warp_size}
             by_opts = {by, ((by + warp_size - 1) // warp_size) * warp_size}
             bz_opts = {bz}
@@ -660,7 +715,6 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                                 candidates.append(t)
                                 seen.add(t)
 
-        # 1D kernels -> vary block_x; keep by=bz=1
         if dimensionality == 1:
             base = [32, 64, 128, 256, 512, 1024]
             base = [b for b in base if b <= max_threads_per_block]
@@ -675,7 +729,6 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                 add_candidate(b, 1, 1)
             return candidates
 
-        # For 2D and 3D kernels we build base tiles and then extend with small z values for 3D
         small = [4, 8, 16, 32, 64, 128]
         small = [x for x in small if x <= max_threads_per_block]
 
@@ -698,16 +751,12 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
             t for t in basic_tiles_2d if t[0] * t[1] <= max_threads_per_block
         ]
 
-        # divisors for tiling if N present
         divisors = []
         if N:
             divisors = MultiModelSuggester._divisors_of(N, max_threads_per_block)
 
-        # candidate z-values for 3D kernels (keep small to avoid exceeding per-block threads)
-        # For 3D kernels, bias towards higher z values by listing them first
         z_candidates = [8, 4, 2, 1] if dimensionality >= 3 else [1]
 
-        # seed with basic 2D tiles and small*small grid
         for bx, by in basic_tiles_2d:
             for bz in z_candidates:
                 add_candidate(bx, by, bz)
@@ -718,7 +767,6 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                     if bx * by * bz <= max_threads_per_block:
                         add_candidate(bx, by, bz)
 
-        # include divisor-derived tiles
         if divisors:
             for d in divisors[:8]:
                 for bz in z_candidates:
@@ -728,9 +776,7 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                     add_candidate(d, 8, bz)
                     add_candidate(8, d, bz)
 
-        # bias selection
         if dimensionality >= 3:
-            # For 3D kernels, prefer configs with higher block_z values
             candidates = sorted(candidates, key=lambda t: (-t[2], t[0] * t[1] * t[2]))
         elif (
             prefer_more_threads_if_compute_bound and compute_intensity >= 2.0
@@ -739,7 +785,6 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
         else:
             candidates = sorted(candidates, key=lambda t: (t[0] * t[1] * t[2]))
 
-        # local neighborhood refine for top-K
         def neighbors(tile):
             bx, by, bz = tile
             neigh = []
@@ -760,7 +805,6 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                     candidates.append(n)
                     seen.add(n)
 
-        # dedupe and limit
         final = []
         for t in candidates:
             if t not in final:
@@ -789,9 +833,10 @@ def main():
 
     cuda_file = sys.argv[1]
     use_llm = "--use-llm" in sys.argv
+    use_onnx = "--no-onnx" not in sys.argv
 
     try:
-        suggester = MultiModelSuggester(use_llm=use_llm)
+        suggester = MultiModelSuggester(use_llm=use_llm, use_onnx=use_onnx)
         results = suggester.evaluate_fixed_Ns_and_pick(
             cuda_file,
             Ns=[128, 256, 512, 1024, 2048, 4096],

@@ -22,15 +22,11 @@ def parse_cuda_results_file(filepath: str) -> List[Dict]:
     with open(filepath, "r") as f:
         content = f.read()
 
-    # Extract GPU name from first line
     gpu_match = re.search(r"\[running on device \d+: ([^\]]+)\]", content)
     gpu_name = gpu_match.group(1) if gpu_match else "unknown"
 
-    # Clean up GPU name
     gpu_name = gpu_name.replace(" ", "_").lower()
 
-    # Find all log points and their corresponding traces
-    # Pattern: checking log point [N bx by bz]
     log_points = re.finditer(
         r"checking log point \[(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\]", content
     )
@@ -41,24 +37,19 @@ def parse_cuda_results_file(filepath: str) -> List[Dict]:
         by = int(match.group(3))
         bz = int(match.group(4))
 
-        # Find the trace line immediately after this log point
         trace_start = match.end()
         trace_text = content[
             trace_start : trace_start + 800
         ]  # Look ahead 800 chars for multiple kernels
 
-        # Find the trace line
         trace_line_match = re.search(r"\[trace:[^\]]+\]", trace_text)
         if not trace_line_match:
             continue
 
         trace_line = trace_line_match.group(0)
 
-        # Extract ALL elapsed_KERNEL=TIME pairs from the trace line
-        # Pattern: elapsed_KERNEL_NAME=TIME
         kernel_timings = re.findall(r"elapsed_([^=]+)=([\d.]+)\s*\(ms\)", trace_line)
 
-        # Create a result entry for EACH kernel in this trace
         for kernel_name, exec_time in kernel_timings:
             kernel_name = kernel_name.strip()
             exec_time = float(exec_time)
@@ -96,8 +87,6 @@ def parse_kernel_table_file(filepath: str) -> List[Dict]:
     """
     results = []
 
-    # Extract kernel name from filename
-    # Format: kernel_KERNELNAME_table_GPU.txt
     filename = Path(filepath).name
     match = re.match(r"kernel_(.+)_table_(.+)\.txt", filename)
     if not match:
@@ -109,7 +98,6 @@ def parse_kernel_table_file(filepath: str) -> List[Dict]:
     with open(filepath, "r") as f:
         content = f.read()
 
-    # Split into individual entries (each starts with [N: ...])
     entries = re.split(r"(?=\[N: \d+\])", content)
 
     gpu_freq_ghz = 1.5  # Default GPU frequency for cycle-to-time conversion
@@ -118,7 +106,6 @@ def parse_kernel_table_file(filepath: str) -> List[Dict]:
         if not entry.strip():
             continue
 
-        # Extract all fields from this entry
         n_match = re.search(r"\[N: (\d+)\]", entry)
         b0_match = re.search(r"\[b0: (\d+)\]", entry)
         b1_match = re.search(r"\[b1: (\d+)\]", entry)
@@ -136,7 +123,6 @@ def parse_kernel_table_file(filepath: str) -> List[Dict]:
                 int(threads_match.group(1)) if threads_match else bx * by
             )
 
-            # Convert cycles to milliseconds
             exec_time = (exec_cycles / (gpu_freq_ghz * 1e9)) * 1000  # Convert to ms
 
             results.append(
@@ -167,7 +153,6 @@ def parse_kernel_results_file(filepath: str) -> List[Dict]:
     """
     results = []
 
-    # Extract kernel name from filename
     filename = Path(filepath).name
     match = re.match(r"kernel_(.+)_results_(.+)\.txt", filename)
     if not match:
@@ -179,8 +164,6 @@ def parse_kernel_results_file(filepath: str) -> List[Dict]:
     with open(filepath, "r") as f:
         content = f.read()
 
-    # Pattern to match each entry
-    # [ N:128, b0:  1, b1: 32, ..., Exec_cycles_app:977131.6052, ... ]
     entries = re.findall(
         r"\[\s*N:\s*(\d+),\s*b0:\s*(\d+)\s*,\s*b1:\s*(\d+)\s*,.*?Exec_cycles_app:\s*([\d.]+).*?occupancy:\s*([\d.]+)",
         content,
@@ -196,7 +179,6 @@ def parse_kernel_results_file(filepath: str) -> List[Dict]:
         exec_cycles = float(exec_cycles)
         occupancy = float(occupancy)
 
-        # Convert cycles to milliseconds
         exec_time = (exec_cycles / (gpu_freq_ghz * 1e9)) * 1000
 
         results.append(
@@ -230,7 +212,6 @@ def extract_all_klaraptor_data(klaraptor_dir: str) -> pd.DataFrame:
 
     klaraptor_path = Path(klaraptor_dir)
 
-    # Find all benchmark directories
     benchmark_dirs = [
         d
         for d in klaraptor_path.iterdir()
@@ -250,7 +231,6 @@ def extract_all_klaraptor_data(klaraptor_dir: str) -> pd.DataFrame:
 
         samples_before = len(all_data)
 
-        # Strategy 1: Try cuda_results_*.txt files first (most comprehensive)
         result_files = list(bench_dir.glob("cuda_results_*.txt"))
         if result_files:
             for result_file in result_files:
@@ -262,7 +242,6 @@ def extract_all_klaraptor_data(klaraptor_dir: str) -> pd.DataFrame:
                 except Exception as e:
                     print(f"  ✗ {result_file.name}: {e}")
 
-        # Strategy 2: If no cuda_results data, try kernel_*_table_*.txt files
         if len(all_data) == samples_before:
             table_files = list(bench_dir.glob("kernel_*_table_*.txt"))
             if table_files:
@@ -277,7 +256,6 @@ def extract_all_klaraptor_data(klaraptor_dir: str) -> pd.DataFrame:
                     except Exception as e:
                         print(f"  ✗ {table_file.name}: {e}")
 
-        # Strategy 3: If still no data, try kernel_*_results_*.txt files
         if len(all_data) == samples_before:
             results_files = list(bench_dir.glob("kernel_*_results_*.txt"))
             if results_files:
@@ -329,7 +307,6 @@ def add_kernel_features(
     """
     from cuda_anal import CUDAKernelAnalyzer
 
-    # Map kernel names to their source files
     kernel_to_file = {
         "Convolution2D_kernel": "stencils/convolution-2d/2DConvolution.cu",
         "convolution3D_kernel": "stencils/convolution-3d/3DConvolution.cu",
@@ -361,7 +338,6 @@ def add_kernel_features(
         "fdtd_step3_kernel": "stencils/fdtd-2d/fdtd2d.cu",
     }
 
-    # Analyze each kernel once
     kernel_features = {}
 
     print("\nAnalyzing kernel source code...")
@@ -377,10 +353,8 @@ def add_kernel_features(
             parser = CUDAKernelAnalyzer(full_path)
             parser.analyze()
 
-            # Find the specific kernel
             kernel_info = None
             for k in parser.kernels:
-                # Match kernel name flexibly
                 k_name_normalized = k["name"].replace("_", "").lower()
                 kernel_name_normalized = kernel_name.replace("_", "").lower()
                 if (
@@ -390,7 +364,6 @@ def add_kernel_features(
                     kernel_info = k
                     break
             if kernel_info:
-                # Extract compute intensity - check both old and new key names
                 compute_intensity = kernel_info["metrics"].get(
                     "compute_intensity"
                 ) or kernel_info["metrics"].get("compute_intensity_flops_per_byte", 0)
@@ -405,7 +378,6 @@ def add_kernel_features(
                     "global_writes": kernel_info["memory_access"]["global_writes"],
                     "arithmetic_ops": kernel_info["operations"]["arithmetic"],
                     "memory_ops": kernel_info["operations"]["memory"],
-                    # New metrics from cuda_anal.py
                     "control_flow_ops": kernel_info["operations"].get(
                         "control_flow", 0
                     ),
@@ -417,7 +389,6 @@ def add_kernel_features(
                     "estimated_memory_bytes": kernel_info["metrics"].get(
                         "estimated_memory_bytes", 0
                     ),
-                    # Thread dimension usage
                     "uses_threadIdx_x": int(
                         kernel_info["thread_usage"].get("uses_threadIdx_x", False)
                     ),
@@ -453,7 +424,6 @@ def add_kernel_features(
         except Exception as e:
             print(f"  ✗ {kernel_name} - {e}")
 
-    # Add features to dataframe (note: column is 'kernel' not 'kernel_name' after rename)
     feature_columns = [
         "dimensionality",
         "compute_intensity",
@@ -462,13 +432,11 @@ def add_kernel_features(
         "global_writes",
         "arithmetic_ops",
         "memory_ops",
-        # New metrics
         "control_flow_ops",
         "loop_ops",
         "uses_syncthreads",
         "estimated_flops",
         "estimated_memory_bytes",
-        # Thread dimension usage
         "uses_threadIdx_x",
         "uses_threadIdx_y",
         "uses_threadIdx_z",
@@ -507,13 +475,10 @@ def main():
         This gives you thousands of training samples instead of hundreds!
 
         Examples:
-        # Extract all timing data
         python3 extract_all_klaraptor_data.py KLARAPTORresults
         
-        # Also add kernel features from source code
         python3 extract_all_klaraptor_data.py KLARAPTORresults --add-features
         
-        # Specify output file
         python3 extract_klaraptor_data.py KLARAPTORresults \\
             --output full_klaraptor_data.csv
         """,
@@ -541,14 +506,12 @@ def main():
     print("=" * 70)
     print()
 
-    # Extract timing data
     df = extract_all_klaraptor_data(args.klaraptor_dir)
 
     if len(df) == 0:
         print("\nERROR: No data extracted!")
         return
 
-    # Rename columns to match expected format
     df = df.rename(
         columns={
             "kernel_name": "kernel",
@@ -558,13 +521,11 @@ def main():
         }
     )
 
-    # Ensure all required columns exist
     if "bz" not in df.columns:
         df["bz"] = 1
     if "total_threads" not in df.columns:
         df["total_threads"] = df["bx"] * df["by"] * df["bz"]
 
-    # Add kernel features if requested
     if args.add_features:
         if not os.path.exists(args.polybench_dir):
             print(f"\nWarning: {args.polybench_dir} not found")
@@ -572,11 +533,9 @@ def main():
         else:
             df = add_kernel_features(df, args.polybench_dir)
 
-    # Save to CSV
     df.to_csv(args.output, index=False)
     print(f"\n✓ Saved {len(df)} samples to {args.output}")
 
-    # Print summary statistics
     print("\n" + "=" * 70)
     print("DATA SUMMARY")
     print("=" * 70)
@@ -601,7 +560,6 @@ def main():
     print(f"  Min: {configs_per_kernel.min()}")
     print(f"  Max: {configs_per_kernel.max()}")
 
-    # Show sample
     print(f"\nSample data:")
     print(df.head(10).to_string())
 

@@ -64,7 +64,6 @@ def augment_data(X, y, kernel_ids, augmentation_factor=3, seed=42):
     np.random.seed(seed)
     X_aug_list, y_aug_list, kid_aug_list = [X], [y], [kernel_ids]
 
-    # Group by kernel
     unique_kernels = np.unique(kernel_ids)
 
     for kernel_id in unique_kernels:
@@ -73,26 +72,20 @@ def augment_data(X, y, kernel_ids, augmentation_factor=3, seed=42):
         y_kernel = y[mask]
 
         if len(X_kernel) < 2:
-            continue  # Need at least 2 samples to interpolate
+            continue
 
         n_samples = len(X_kernel)
         n_synthetic = min(n_samples * augmentation_factor, n_samples * 5)  # Cap at 5x
 
         for _ in range(n_synthetic):
-            # Pick two random samples from same kernel
             idx1, idx2 = np.random.choice(n_samples, 2, replace=False)
 
-            # Beta distribution favors balanced mixing (0.5)
             alpha = np.random.beta(2, 2)
 
-            # Interpolate features (some features should not be interpolated)
             X_new = alpha * X_kernel[idx1] + (1 - alpha) * X_kernel[idx2]
 
-            # For discrete features (uses_*, control_flow_ops, etc.), use majority vote
-            # Assume first feature is kernel_encoded, keep it fixed
             X_new[0] = X_kernel[idx1, 0]
 
-            # Interpolate log(time) - more stable
             y_new = alpha * y_kernel[idx1] + (1 - alpha) * y_kernel[idx2]
 
             X_aug_list.append(X_new.reshape(1, -1))
@@ -149,11 +142,9 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x):
         batch_size = x.size(0)
 
-        # Generate Q, K, V
         qkv = self.qkv(x).reshape(batch_size, 3, self.num_heads, self.head_dim)
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
-        # Scaled dot-product attention
         scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.head_dim)
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
@@ -181,7 +172,6 @@ class MultiTaskExecTimePredictor(nn.Module):
     ):
         super(MultiTaskExecTimePredictor, self).__init__()
 
-        # Shared feature extractor (learns from ALL data)
         shared_layers = []
         prev_dim = input_dim
 
@@ -198,7 +188,6 @@ class MultiTaskExecTimePredictor(nn.Module):
 
         self.shared_encoder = nn.Sequential(*shared_layers)
 
-        # Regime-specific prediction heads
         self.regime_heads = nn.ModuleList()
         for _ in range(num_regimes):
             head_layers = []
@@ -231,14 +220,11 @@ class MultiTaskExecTimePredictor(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x, regime_idx=None):
-        # Shared encoding
         shared_features = self.shared_encoder(x)
 
-        # If regime specified, use that head
         if regime_idx is not None:
             return self.regime_heads[regime_idx](shared_features)
 
-        # Otherwise return all predictions (for multi-task training)
         return [head(shared_features) for head in self.regime_heads]
 
 
@@ -267,7 +253,6 @@ class LargeExecTimePredictor(nn.Module):
 
         self.use_attention = use_attention
 
-        # Feature embedding
         self.input_embed = nn.Sequential(
             nn.Linear(input_dim, hidden_dims[0]),
             nn.LayerNorm(hidden_dims[0]),
@@ -275,22 +260,18 @@ class LargeExecTimePredictor(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Multi-head attention for feature interactions
         if use_attention:
             self.attention = MultiHeadAttention(
                 hidden_dims[0], num_heads=8, dropout=dropout
             )
 
-        # Deep network with residual connections
         layers = []
         prev_dim = hidden_dims[0]
 
         for i, hidden_dim in enumerate(hidden_dims):
             if prev_dim == hidden_dim and i > 0:
-                # Add residual block when dimensions match
                 layers.append(ResidualBlock(hidden_dim, dropout=dropout))
             else:
-                # Regular layer with dimension change
                 layers.extend(
                     [
                         nn.Linear(prev_dim, hidden_dim),
@@ -301,13 +282,11 @@ class LargeExecTimePredictor(nn.Module):
                 )
             prev_dim = hidden_dim
 
-        # Additional residual blocks at the end for better representation
         for _ in range(num_residual_blocks):
             layers.append(ResidualBlock(prev_dim, dropout=dropout))
 
         self.network = nn.Sequential(*layers)
 
-        # Output head with multiple layers
         self.output_head = nn.Sequential(
             nn.Linear(prev_dim, prev_dim // 2),
             nn.LayerNorm(prev_dim // 2),
@@ -316,7 +295,6 @@ class LargeExecTimePredictor(nn.Module):
             nn.Linear(prev_dim // 2, 1),
         )
 
-        # Initialize weights
         self._init_weights()
 
     def _init_weights(self):
@@ -331,17 +309,13 @@ class LargeExecTimePredictor(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        # Embed input features
         x = self.input_embed(x)
 
-        # Apply attention
         if self.use_attention:
             x = x + self.attention(x)  # Residual connection
 
-        # Deep network
         x = self.network(x)
 
-        # Output
         x = self.output_head(x)
 
         return x
@@ -369,12 +343,10 @@ class AdvancedModelTrainer:
             outputs = self.model(batch_X)
             loss = criterion(outputs, batch_y)
 
-            # Gradient accumulation
             loss = loss / gradient_accumulation_steps
             loss.backward()
 
             if (idx + 1) % gradient_accumulation_steps == 0:
-                # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
@@ -421,7 +393,6 @@ class AdvancedModelTrainer:
             self.model.parameters(), lr=lr, weight_decay=0.01, betas=(0.9, 0.999)
         )
 
-        # Learning rate scheduler: warmup + cosine annealing
         def lr_lambda(epoch):
             if epoch < warmup_epochs:
                 return (epoch + 1) / warmup_epochs
@@ -493,14 +464,12 @@ def pretrain_base_model(csv_file, output_dir, epochs=100):
     print("PRE-TRAINING BASE MODEL ON ALL DATA")
     print("=" * 70)
 
-    # Load all data (no time filtering)
     X, y, features, kernel_encoder, df = prepare_data(
         csv_file, time_min=None, time_max=None
     )
 
     print(f"Pre-training on {len(X):,} samples")
 
-    # Split and scale
     X_train, X_val, y_train, y_val = train_test_split(
         X, y, test_size=0.15, random_state=42
     )
@@ -509,14 +478,12 @@ def pretrain_base_model(csv_file, output_dir, epochs=100):
     X_train_scaled = scaler.fit_transform(X_train)
     X_val_scaled = scaler.transform(X_val)
 
-    # Datasets
     train_dataset = KernelDataset(X_train_scaled, y_train)
     val_dataset = KernelDataset(X_val_scaled, y_val)
 
     train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=256)
 
-    # Create base model (slightly smaller for generalization)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
@@ -530,7 +497,6 @@ def pretrain_base_model(csv_file, output_dir, epochs=100):
 
     print(f"Base model parameters: {sum(p.numel() for p in base_model.parameters()):,}")
 
-    # Train
     trainer = AdvancedModelTrainer(base_model, device=device)
     best_loss = trainer.train(
         train_loader,
@@ -542,11 +508,27 @@ def pretrain_base_model(csv_file, output_dir, epochs=100):
         gradient_accumulation_steps=1,
     )
 
-    # Save base model
     output_path = Path(output_dir) / "base_pretrained"
     output_path.mkdir(parents=True, exist_ok=True)
 
     torch.save(base_model.state_dict(), output_path / "model.pth")
+
+    base_model.eval()
+    dummy_input = torch.randn(1, len(features), device=device)
+    onnx_path = output_path / "model.onnx"
+
+    torch.onnx.export(
+        base_model,
+        dummy_input,
+        onnx_path,
+        export_params=True,
+        opset_version=11,
+        do_constant_folding=True,
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+    )
+    print(f"✓ Exported to ONNX: {onnx_path}")
 
     with open(output_path / "metadata.pkl", "wb") as f:
         pickle.dump(
@@ -567,19 +549,16 @@ def pretrain_base_model(csv_file, output_dir, epochs=100):
 
 def prepare_features(df):
     """Prepare features with engineering"""
-    # N-based features
     df["log_N"] = np.log(df["N"] + 1)
     df["sqrt_N"] = np.sqrt(df["N"])
     df["N_squared"] = df["N"] ** 2
     df["N_cubed"] = df["N"] ** 3
 
-    # Block configuration features
     df["total_threads"] = df["block_x"] * df["block_y"]
     df["log_threads"] = np.log(df["total_threads"] + 1)
     df["block_aspect_ratio"] = df["block_x"] / (df["block_y"] + 1)
     df["block_product"] = df["block_x"] * df["block_y"]
 
-    # Interaction features
     df["N_per_thread"] = df["N"] / (df["total_threads"] + 1)
     df["compute_per_thread"] = (
         df["compute_intensity"] * df["arithmetic_ops"] / (df["total_threads"] + 1)
@@ -587,7 +566,6 @@ def prepare_features(df):
     df["memory_per_thread"] = df["estimated_memory_bytes"] / (df["total_threads"] + 1)
     df["flops_per_thread"] = df["estimated_flops"] / (df["total_threads"] + 1)
 
-    # Advanced interaction features
     df["compute_to_memory_ratio"] = df["arithmetic_ops"] / (df["memory_ops"] + 1)
     df["read_write_ratio"] = df["global_reads"] / (df["global_writes"] + 1)
 
@@ -598,7 +576,6 @@ def prepare_data(csv_file, time_min=None, time_max=None, use_kernel_names=True):
     """Prepare data with time filtering"""
     df = pd.read_csv(csv_file)
 
-    # Handle column naming
     column_mapping = {
         "kernel": "kernel_name",
         "bx": "block_x",
@@ -607,7 +584,6 @@ def prepare_data(csv_file, time_min=None, time_max=None, use_kernel_names=True):
     }
     df = df.rename(columns={k: v for k, v in column_mapping.items() if k in df.columns})
 
-    # Filter by execution time
     if time_min is not None:
         df = df[df["exec_time"] >= time_min]
     if time_max is not None:
@@ -621,10 +597,8 @@ def prepare_data(csv_file, time_min=None, time_max=None, use_kernel_names=True):
         f"Log exec time range: {np.log(df['exec_time'].min()):.2f} - {np.log(df['exec_time'].max()):.2f}"
     )
 
-    # Feature engineering
     df = prepare_features(df)
 
-    # Fill missing new features with 0 (backward compatibility)
     new_features = [
         "control_flow_ops",
         "loop_ops",
@@ -645,7 +619,6 @@ def prepare_data(csv_file, time_min=None, time_max=None, use_kernel_names=True):
         if feat not in df.columns:
             df[feat] = 0
 
-    # Define feature columns (expanded)
     numeric_features = [
         "N",
         "log_N",
@@ -687,7 +660,6 @@ def prepare_data(csv_file, time_min=None, time_max=None, use_kernel_names=True):
         "uses_blockDim_z",
     ]
 
-    # Kernel encoding
     kernel_encoder = None
     if use_kernel_names:
         kernel_encoder = LabelEncoder()
@@ -718,11 +690,9 @@ def evaluate_model(model, test_loader, scaler, device="cpu"):
     predictions_log = np.concatenate(all_predictions)
     actuals_log = np.concatenate(all_actuals)
 
-    # Convert to real space
     predictions_real = np.exp(predictions_log)
     actuals_real = np.exp(actuals_log)
 
-    # Metrics
     r2_log = r2_score(actuals_log, predictions_log)
     mae_log = mean_absolute_error(actuals_log, predictions_log)
 
@@ -793,7 +763,6 @@ def train_specialized_model(
     original_size = len(X)
     print(f"Original samples: {original_size:,}")
 
-    # Data Augmentation for sparse regimes
     if use_augmentation and original_size < 2000:
         augmentation_factor = max(1, min(5, 2000 // original_size))
         print(f"Applying augmentation (factor={augmentation_factor})...")
@@ -802,7 +771,6 @@ def train_specialized_model(
         )
         print(f"Augmented samples: {len(X):,} (+{len(X) - original_size:,})")
 
-    # Split and scale
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
@@ -811,18 +779,15 @@ def train_specialized_model(
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    # Datasets with larger batch size for large model
     train_dataset = KernelDataset(X_train_scaled, y_train)
     test_dataset = KernelDataset(X_test_scaled, y_test)
 
     train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=128)
 
-    # Large model
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Transfer Learning: Start from pre-trained model
     if use_transfer_learning and pretrained_model is not None:
         print("Initializing from pre-trained base model...")
         model = LargeExecTimePredictor(
@@ -833,12 +798,10 @@ def train_specialized_model(
             num_residual_blocks=3,
         )
 
-        # Load pre-trained weights (partial loading for matching layers)
         try:
             pretrained_dict = pretrained_model.state_dict()
             model_dict = model.state_dict()
 
-            # Filter out layers that don't match
             pretrained_dict = {
                 k: v
                 for k, v in pretrained_dict.items()
@@ -863,7 +826,6 @@ def train_specialized_model(
 
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Fine-tuning with lower learning rate if using transfer learning
     lr = 0.0001 if (use_transfer_learning and pretrained_model) else 0.0005
 
     trainer = AdvancedModelTrainer(model, device=device)
@@ -877,15 +839,30 @@ def train_specialized_model(
         gradient_accumulation_steps=2,
     )
 
-    # Evaluate
     print(f"\n{model_name.upper()} MODEL EVALUATION:")
     metrics = evaluate_model(model, test_loader, scaler, device)
 
-    # Save
     output_path = Path(output_dir) / model_name
     output_path.mkdir(parents=True, exist_ok=True)
 
     torch.save(model.state_dict(), output_path / "model.pth")
+
+    model.eval()
+    dummy_input = torch.randn(1, len(features), device=device)
+    onnx_path = output_path / "model.onnx"
+
+    torch.onnx.export(
+        model,
+        dummy_input,
+        onnx_path,
+        export_params=True,
+        opset_version=11,
+        do_constant_folding=True,
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+    )
+    print(f"✓ Exported to ONNX: {onnx_path}")
 
     with open(output_path / "metadata.pkl", "wb") as f:
         pickle.dump(
@@ -911,20 +888,51 @@ def train_specialized_model(
 
 
 class EnsemblePredictor:
-    """Smart ensemble predictor with 5-regime model routing"""
+    """Smart ensemble predictor with 5-regime model routing (ONNX-based)"""
 
-    def __init__(self, models_dir):
+    def __init__(self, models_dir, use_onnx=True):
+        self.models_dir = Path(models_dir)
         self.models = {}
         self.metadata = {}
+        self.use_onnx = use_onnx
+
+        print(f"Loading ensemble models from {models_dir}...")
 
         for model_name in ["fast", "medium_fast", "medium", "medium_slow", "slow"]:
-            model_path = Path(models_dir) / model_name
-            if model_path.exists():
-                # Load metadata
-                with open(model_path / "metadata.pkl", "rb") as f:
-                    meta = pickle.load(f)
+            model_path = self.models_dir / model_name
+            if not model_path.exists():
+                continue
 
-                # Load model
+            meta_path = model_path / "metadata.pkl"
+            if not meta_path.exists():
+                continue
+
+            with open(meta_path, "rb") as f:
+                meta = pickle.load(f)
+
+            if use_onnx:
+                onnx_path = model_path / "model.onnx"
+                if not onnx_path.exists():
+                    print(f"  ⚠️  {model_name}: ONNX model not found, skipping")
+                    continue
+
+                import onnxruntime as ort
+
+                session = ort.InferenceSession(
+                    str(onnx_path), providers=["CPUExecutionProvider"]
+                )
+                self.models[model_name] = session
+
+                time_range = meta.get("time_range", (None, None))
+                print(
+                    f"  ✓ {model_name}: {time_range[0] if time_range[0] else 0:.3f} - {time_range[1] if time_range[1] else 'inf'} ms (ONNX)"
+                )
+            else:
+                pth_path = model_path / "model.pth"
+                if not pth_path.exists():
+                    print(f"  ⚠️  {model_name}: PyTorch model not found, skipping")
+                    continue
+
                 model = LargeExecTimePredictor(
                     input_dim=len(meta["features"]),
                     **meta.get(
@@ -937,26 +945,26 @@ class EnsemblePredictor:
                         },
                     ),
                 )
-                model.load_state_dict(
-                    torch.load(model_path / "model.pth", weights_only=True)
-                )
+                model.load_state_dict(torch.load(pth_path, weights_only=True))
                 model.eval()
-
                 self.models[model_name] = model
-                self.metadata[model_name] = meta
 
+                time_range = meta.get("time_range", (None, None))
                 print(
-                    f"✓ Loaded {model_name} model (R²={meta['metrics']['r2_real']:.3f})"
+                    f"  ✓ {model_name}: {time_range[0] if time_range[0] else 0:.3f} - {time_range[1] if time_range[1] else 'inf'} ms"
                 )
+
+            self.metadata[model_name] = meta
+
+        if not self.models:
+            raise ValueError(f"No models loaded from {models_dir}")
 
     def estimate_regime(self, kernel_info):
         """Estimate which time regime this kernel falls into (5 regimes)"""
-        # Simple heuristic based on problem size and complexity
         N = kernel_info.get("N", 1024)
         dim = kernel_info.get("dimensionality", 1)
         compute = kernel_info.get("compute_intensity", 1.0)
 
-        # Rough estimate: time ~ N^dim * compute / 100000
         estimated_time = (N**dim) * compute / 100000.0
 
         if estimated_time < 0.5:
@@ -975,10 +983,8 @@ class EnsemblePredictor:
         meta = self.metadata[model_name]
         model = self.models[model_name]
 
-        # Prepare features (match training)
         feature_values = []
 
-        # Create temp dataframe to use prepare_features
         temp_df = pd.DataFrame(
             [
                 {
@@ -1014,7 +1020,6 @@ class EnsemblePredictor:
 
         temp_df = prepare_features(temp_df)
 
-        # Extract feature values in correct order
         for feat in meta["features"]:
             if feat == "kernel_encoded":
                 try:
@@ -1032,24 +1037,27 @@ class EnsemblePredictor:
         X = np.array([feature_values])
         X_scaled = meta["scaler"].transform(X)
 
-        # Predict
-        X_tensor = torch.FloatTensor(X_scaled)
-        with torch.no_grad():
-            pred_log = model(X_tensor).item()
+        if self.use_onnx:
+            model = self.models[model_name]
+            pred_log = model.run(["output"], {"input": X_scaled.astype(np.float32)})[0][
+                0, 0
+            ]
+        else:
+            model = self.models[model_name]
+            X_tensor = torch.FloatTensor(X_scaled)
+            with torch.no_grad():
+                pred_log = model(X_tensor).item()
 
-        return np.exp(pred_log)
+        return float(np.exp(pred_log))
 
     def predict_optimal_config(self, kernel_info, candidate_configs=None):
         """Find optimal config using appropriate model(s)"""
-        # Determine regime
         regime = self.estimate_regime(kernel_info)
 
         if regime not in self.models:
-            # Fallback to any available model
             regime = list(self.models.keys())[0]
             print(f"⚠ Using fallback model: {regime}")
 
-        # Generate candidates
         if candidate_configs is None:
             dim = kernel_info.get("dimensionality", 1)
             if dim == 1:
@@ -1077,7 +1085,6 @@ class EnsemblePredictor:
                     (256, 4),
                 ]
 
-        # Predict for all configs
         predictions = []
         for block_x, block_y in candidate_configs:
             pred_time = self.predict_single(regime, kernel_info, block_x, block_y)
@@ -1085,7 +1092,6 @@ class EnsemblePredictor:
                 {"block_x": block_x, "block_y": block_y, "predicted_time": pred_time}
             )
 
-        # Find best
         best = min(predictions, key=lambda x: x["predicted_time"])
 
         return best["block_x"], best["block_y"], best["predicted_time"], predictions
@@ -1159,14 +1165,12 @@ def main():
         print("  ✓ Adaptive augmentation based on sample count")
         print("=" * 70)
 
-        # Step 1: Pre-train base model on all data
         print("\n[STEP 1/6] PRE-TRAINING BASE MODEL")
         base_model, base_scaler, base_features, base_encoder = pretrain_base_model(
             args.csv_file, args.output_dir, epochs=100
         )
         print("\n")
 
-        # Train 5 specialized models with transfer learning
         print("[STEP 2/6] FAST MODEL (<0.5ms)")
         metrics_fast = train_specialized_model(
             args.csv_file,
@@ -1227,7 +1231,6 @@ def main():
             pretrained_model=base_model,
         )
 
-        # Summary
         print("\n" + "=" * 70)
         print("TRAINING COMPLETE - SUMMARY")
         print("=" * 70)
