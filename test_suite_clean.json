@@ -1,0 +1,194 @@
+{
+  "kernels": {
+    "scalar_product.cu::scalar_prod": {
+      "kernel_name": "scalar_prod",
+      "cuda_file": "test-files-forced/scalar_product.cu",
+      "optimal_config": {
+        "block_x": 8,
+        "block_y": 32,
+        "block_z": 1
+      },
+      "ensemble_config": {
+        "block_x": 8,
+        "block_y": 32,
+        "block_z": 1
+      },
+      "random_forest_config": {
+        "block_x": 16,
+        "block_y": 1,
+        "block_z": 1
+      }
+    },
+    "histogram.cu::histogram_kernel": {
+      "kernel_name": "histogram_kernel",
+      "cuda_file": "test-files-forced/histogram.cu",
+      "optimal_config": {
+        "block_x": 8,
+        "block_y": 32,
+        "block_z": 1
+      },
+      "ensemble_config": {
+        "block_x": 8,
+        "block_y": 32,
+        "block_z": 1
+      },
+      "random_forest_config": {
+        "block_x": 8,
+        "block_y": 1,
+        "block_z": 1
+      }
+    },
+    "vector-addition.cu::vector_add": {
+      "kernel_name": "vector_add",
+      "cuda_file": "test-files-forced/vector-addition.cu",
+      "optimal_config": {
+        "block_x": 8,
+        "block_y": 32,
+        "block_z": 1
+      },
+      "ensemble_config": {
+        "block_x": 8,
+        "block_y": 32,
+        "block_z": 1
+      },
+      "random_forest_config": {
+        "block_x": 8,
+        "block_y": 1,
+        "block_z": 1
+      }
+    },
+    "reduction.cu::reduce_sum": {
+      "kernel_name": "reduce_sum",
+      "cuda_file": "test-files-forced/reduction.cu",
+      "optimal_config": {
+        "block_x": 8,
+        "block_y": 32,
+        "block_z": 1
+      },
+      "ensemble_config": {
+        "block_x": 8,
+        "block_y": 32,
+        "block_z": 1
+      },
+      "random_forest_config": {
+        "block_x": 16,
+        "block_y": 1,
+        "block_z": 1
+      }
+    },
+    "matrix_multiplication.cu::matrix_mul": {
+      "kernel_name": "matrix_mul",
+      "cuda_file": "test-files-forced/matrix_multiplication.cu",
+      "optimal_config": {
+        "block_x": 4,
+        "block_y": 4,
+        "block_z": 1
+      },
+      "ensemble_config": {
+        "block_x": 4,
+        "block_y": 4,
+        "block_z": 1
+      },
+      "random_forest_config": {
+        "block_x": 16,
+        "block_y": 2,
+        "block_z": 1
+      }
+    },
+    "matrix_transpose.cu::transpose_naive": {
+      "kernel_name": "transpose_naive",
+      "cuda_file": "test-files-forced/matrix_transpose.cu",
+      "optimal_config": {
+        "block_x": 4,
+        "block_y": 4,
+        "block_z": 1
+      },
+      "ensemble_config": {
+        "block_x": 4,
+        "block_y": 4,
+        "block_z": 1
+      },
+      "random_forest_config": {
+        "block_x": 4,
+        "block_y": 16,
+        "block_z": 1
+      }
+    },
+    "conv3D.cu::convolution_3d": {
+      "kernel_name": "convolution_3d",
+      "cuda_file": "test-files-forced/conv3D.cu",
+      "optimal_config": {
+        "block_x": 4,
+        "block_y": 4,
+        "block_z": 1
+      },
+      "ensemble_config": {
+        "block_x": 4,
+        "block_y": 4,
+        "block_z": 1
+      },
+      "random_forest_config": {
+        "block_x": 16,
+        "block_y": 4,
+        "block_z": 1
+      }
+    },
+    "conv2D.cu::convolution_2d": {
+      "kernel_name": "convolution_2d",
+      "cuda_file": "test-files-forced/conv2D.cu",
+      "optimal_config": {
+        "block_x": 4,
+        "block_y": 4,
+        "block_z": 1
+      },
+      "ensemble_config": {
+        "block_x": 4,
+        "block_y": 4,
+        "block_z": 1
+      },
+      "random_forest_config": {
+        "block_x": 32,
+        "block_y": 2,
+        "block_z": 1
+      }
+    },
+    "AXPY.cu::axpy": {
+      "kernel_name": "axpy",
+      "cuda_file": "test-files-forced/AXPY.cu",
+      "optimal_config": {
+        "block_x": 8,
+        "block_y": 32,
+        "block_z": 1
+      },
+      "ensemble_config": {
+        "block_x": 8,
+        "block_y": 32,
+        "block_z": 1
+      },
+      "random_forest_config": {
+        "block_x": 8,
+        "block_y": 1,
+        "block_z": 1
+      }
+    },
+    "stencil1D.cu::stencil_1d": {
+      "kernel_name": "stencil_1d",
+      "cuda_file": "test-files-forced/stencil1D.cu",
+      "optimal_config": {
+        "block_x": 8,
+        "block_y": 32,
+        "block_z": 1
+      },
+      "ensemble_config": {
+        "block_x": 8,
+        "block_y": 32,
+        "block_z": 1
+      },
+      "random_forest_config": {
+        "block_x": 16,
+        "block_y": 1,
+        "block_z": 1
+      }
+    }
+  }
+}

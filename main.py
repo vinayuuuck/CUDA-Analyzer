@@ -21,11 +21,12 @@ class MultiModelSuggester:
     Suggests optimal launch configs using 3 approaches:
     1. Random Forest (baseline)
     2. Ensemble DNNs (best accuracy)
-    3. Fine-tuned LLM (if available)
+    3. Fine-tuned LLM (if available and explicitly requested)
     """
 
-    def __init__(self):
+    def __init__(self, use_llm=False):
         self.models_loaded = {"random_forest": False, "ensemble": False, "llm": False}
+        self.use_llm = use_llm
 
         try:
             self._load_random_forest()
@@ -37,10 +38,11 @@ class MultiModelSuggester:
         except Exception as e:
             print(f"Ensemble DNNs not available: {e}")
 
-        try:
-            self._load_llm()
-        except Exception as e:
-            print(f"LLM not available: {e}")
+        if self.use_llm:
+            try:
+                self._load_llm()
+            except Exception as e:
+                print(f"LLM not available: {e}")
 
         if not any(self.models_loaded.values()):
             raise RuntimeError("No models available! Train at least one model first.")
@@ -68,7 +70,7 @@ class MultiModelSuggester:
         print("Random Forest loaded")
 
     def _load_ensemble(self):
-        from ensemble_exec_time_predictor_large import EnsemblePredictor
+        from ensemble_dnn import EnsemblePredictor
 
         models_dir = "ensemble_models_large"
         if not os.path.exists(models_dir):
@@ -372,7 +374,7 @@ Configuration: block_dims=({bx}, {by}, 1), total_threads={total_threads}
                         kernel_info, int(N), candidates
                     )
 
-                if self.models_loaded.get("llm"):
+                if self.use_llm and self.models_loaded.get("llm"):
                     all_model_preds["llm"] = self._predict_llm(
                         kernel_info, int(N), candidates
                     )
@@ -770,24 +772,26 @@ def main():
     if len(sys.argv) < 2:
         print("CUDA Kernel Launch Configuration Optimizer")
         print("=" * 60)
-        print("\nUsage: python3 main.py <cuda_file.cu>")
+        print("\nUsage: python3 main.py <cuda_file.cu> [--use-llm]")
         print("\nExamples:")
         print("  python3 main.py vec_add.cu")
         print(
             "  python3 main.py PolybenchCUDA/stencils/convolution-2d/2DConvolution.cu"
         )
+        print("  python3 main.py my_kernel.cu --use-llm  # Include LLM predictions")
         print("\nThis tool evaluates kernels across multiple problem sizes")
         print("and recommends the best configuration using:")
         print("  • Random Forest (baseline)")
         print("  • Ensemble DNNs (best accuracy)")
-        print("  • Fine-tuned LLM (if available)")
+        print("  • Fine-tuned LLM (only if --use-llm flag is provided)")
         print()
         sys.exit(1)
 
     cuda_file = sys.argv[1]
+    use_llm = "--use-llm" in sys.argv
 
     try:
-        suggester = MultiModelSuggester()
+        suggester = MultiModelSuggester(use_llm=use_llm)
         results = suggester.evaluate_fixed_Ns_and_pick(
             cuda_file,
             Ns=[128, 256, 512, 1024, 2048, 4096],
